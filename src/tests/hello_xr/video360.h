@@ -39,10 +39,15 @@ struct Video360Buffer {
 
 class Video360 {
    public:
-    // How many frame buffers the caller should provide. Three deep is enough to absorb
-    // decode-time spikes (keyframes cost far more than P-frames) without adding real latency,
-    // plus one held by the renderer and one being written = five.
-    static constexpr size_t kFrameBuffers = 5;
+    // How many frame buffers the caller should provide: one held by the renderer, one being
+    // written, and the rest absorbing decode-time jitter.
+    //
+    // This was five, which left only three frames of slack - and at 8K60 that was measured to
+    // be too thin: the decoder averaged the full 59 fps but its per-frame time varies enough
+    // (keyframes cost far more than P-frames) that the queue kept running dry, and the
+    // renderer found nothing new to upload on ~25% of frames. Eight costs 3 more frames of
+    // host memory - 126 MB at 8K, nothing at 4K - and covers the jitter.
+    static constexpr size_t kFrameBuffers = 8;
 
     Video360();
     ~Video360();
@@ -53,6 +58,18 @@ class Video360 {
     // Opens the file and reads the stream geometry. Does not decode anything yet, so the
     // caller can size its buffers from Width()/Height(). Returns false (and logs) on failure.
     bool Open(const std::string& path);
+
+    // Whether to rewind and keep going at the end of the file (the default) or stop and let
+    // Finished() go true, which is what a playlist wants. Call before Start().
+    void SetLoop(bool loop);
+
+    // Playback speed. 1.0 is normal, 0.5 is half speed, 0 pauses. Safe to change at any time:
+    // it only affects how fast the clock runs from that point on. Decoding is unaffected -
+    // the decoder simply waits longer for the renderer to hand buffers back.
+    void SetRate(double rate);
+
+    // True once the last frame has had its turn on screen. Always false when looping.
+    bool Finished() const;
 
     // Hands over the destination buffers. Must be called after Open() and before Start(),
     // with at least two buffers (kFrameBuffers is the sane number).

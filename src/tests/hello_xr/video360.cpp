@@ -16,6 +16,9 @@ bool Video360::Open(const std::string&) {
 }
 void Video360::SetFrameBuffers(std::vector<Video360Buffer>) {}
 bool Video360::Start() { return false; }
+void Video360::SetLoop(bool) {}
+void Video360::SetRate(double) {}
+bool Video360::Finished() const { return true; }
 bool Video360::IsOpen() const { return false; }
 int Video360::Width() const { return 0; }
 int Video360::Height() const { return 0; }
@@ -135,7 +138,19 @@ struct Video360::Impl {
     bool opened{false};
     bool started{false};
 
-    std::chrono::steady_clock::time_point clockStart;
+    // Playlist support: stop at the end of the file instead of rewinding, and let the caller
+    // see when the last frame has had its time on screen.
+    bool loop{true};
+    std::atomic<bool> decodeDone{false};
+    double finalPts{0.0};  // pts of the last frame queued; guarded by mutex
+
+    // Playback clock. Wall time is accumulated into playbackTime scaled by the current rate,
+    // rather than being read as (now - start): that way pausing (rate 0) or slowing down
+    // mid-playback just changes how fast the clock runs from here on, with no discontinuity
+    // and nothing to recompute.
+    std::chrono::steady_clock::time_point lastTick;
+    double playbackTime{0.0};
+    std::atomic<double> rate{1.0};
     bool clockStarted{false};
 
     // HELLO_XR_VIDEO_STATS: what the decode thread costs, and whether it is the bottleneck.
@@ -335,9 +350,11 @@ struct Video360::Impl {
             int ret = av_read_frame(fmt, packet);
 
             if (ret == AVERROR_EOF) {
-                // Flush whatever the decoder is still holding, then rewind and keep going.
+                // Flush whatever the decoder is still holding, then either rewind and keep
+                // going or stop so the caller can move on to the next file in a playlist.
                 avcodec_send_packet(dec, nullptr);
                 DrainDecoder(frame, swFrame, loopOffset, lastPts);
+                if (!loop) break;
                 avcodec_flush_buffers(dec);
                 loopOffset = lastPts + frameDuration;
                 if (av_seek_frame(fmt, streamIndex, 0, AVSEEK_FLAG_BACKWARD) < 0) {
@@ -365,6 +382,10 @@ struct Video360::Impl {
         av_frame_free(&swFrame);
         av_frame_free(&frame);
         av_packet_free(&packet);
+
+        // Set last: AcquireCurrentSlot only calls it "finished" once the queue has drained too,
+        // so the final frames still get their time on screen.
+        decodeDone = true;
     }
 
     // Pulls every frame the decoder can currently produce, writes it as NV12 into a free
@@ -428,6 +449,7 @@ struct Video360::Impl {
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 queue.push_back(QueuedFrame{slot, pts + loopOffset});
+                finalPts = pts + loopOffset;
             }
 
             if (wantStats) {
@@ -600,6 +622,22 @@ bool Video360::Start() {
     return true;
 }
 
+void Video360::SetLoop(bool loop) { m_impl->loop = loop; }
+void Video360::SetRate(double rate) { m_impl->rate = (rate > 0.0) ? rate : 0.0; }
+
+bool Video360::Finished() const {
+    Impl& impl = *m_impl;
+    if (impl.loop || !impl.started) return false;
+    if (!impl.decodeDone) return false;
+
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    if (!impl.queue.empty()) return false;
+    // The decoder never produced anything at all - a broken file. Say finished so a playlist
+    // moves on instead of sitting on a black skybox forever.
+    if (!impl.clockStarted) return true;
+    return impl.playbackTime >= impl.finalPts + impl.frameDuration;
+}
+
 bool Video360::IsOpen() const { return m_impl->opened; }
 int Video360::Width() const { return m_impl->width; }
 int Video360::Height() const { return m_impl->height; }
@@ -619,14 +657,20 @@ int Video360::AcquireCurrentSlot() {
     std::unique_lock<std::mutex> lock(impl.mutex);
 
     // Start the clock on the first frame rather than at Start(), so however long the decoder
-    // took to spin up does not count as playback time already elapsed.
+    // took to spin up does not count as playback time already elapsed. Starting it AT the
+    // first frame's pts (not at zero) also means a file whose timestamps do not begin at zero
+    // does not have its opening seconds skipped.
+    const auto now = std::chrono::steady_clock::now();
     if (!impl.clockStarted) {
         if (impl.queue.empty()) return -1;
-        impl.clockStart = std::chrono::steady_clock::now();
+        impl.playbackTime = impl.queue.front().pts;
+        impl.lastTick = now;
         impl.clockStarted = true;
+    } else {
+        impl.playbackTime += std::chrono::duration<double>(now - impl.lastTick).count() * impl.rate.load();
+        impl.lastTick = now;
     }
-
-    const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - impl.clockStart).count();
+    const double elapsed = impl.playbackTime;
 
     // Advance to the newest frame whose presentation time has passed. The loop (rather than a
     // single pop) means that if rendering stalls we skip stale frames instead of playing them

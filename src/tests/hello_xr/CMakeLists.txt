@@ -29,6 +29,7 @@ set(LOCAL_HEADERS
     pch.h
     platformdata.h
     platformplugin.h
+    playercontrol.h
     projection360.h
     swapchain_image_data.h
     video360.h
@@ -52,6 +53,7 @@ set(LOCAL_SOURCE
     platformplugin_factory.cpp
     platformplugin_posix.cpp
     platformplugin_win32.cpp
+    playercontrol.cpp
     projection360.cpp
     swapchain_image_data.cpp
     video360.cpp

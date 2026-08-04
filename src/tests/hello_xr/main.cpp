@@ -9,6 +9,9 @@
 #include "platformplugin.h"
 #include "graphicsplugin.h"
 #include "openxr_program.h"
+#include "playercontrol.h"
+
+#include <cstdlib>
 
 #if defined(_WIN32)
 // Favor the high performance NVIDIA or AMD GPUs
@@ -296,12 +299,21 @@ int main(int argc, char* argv[]) {
 
         std::shared_ptr<PlatformData> data = std::make_shared<PlatformData>();
 
-        // Spawn a thread to wait for a keypress
+        // One thread reading stdin drives the transport controls. It used to be "any key
+        // quits"; now only q/ESC/EOF do, and the rest are pause, speed and track skip. On a
+        // pipe (the timed `sleep N | hello_xr` runs) there are no keys and getchar returns EOF
+        // when the pipe closes, which still ends the run exactly as before.
         static bool quitKeyPressed = false;
+        PlayerControl::BeginRawInput();
+        std::atexit(PlayerControl::EndRawInput);
         auto exitPollingThread = std::thread{[] {
-            Log::Write(Log::Level::Info, "Press any key to shutdown...");
-            (void)getchar();
-            quitKeyPressed = true;
+            Log::Write(Log::Level::Info, PlayerControl::HelpLine());
+            while (!quitKeyPressed) {
+                const int c = getchar();
+                PlayerControl::HandleKey(c);
+                if (PlayerControl::QuitRequested()) quitKeyPressed = true;
+                if (c == EOF) break;
+            }
         }};
         exitPollingThread.detach();
 

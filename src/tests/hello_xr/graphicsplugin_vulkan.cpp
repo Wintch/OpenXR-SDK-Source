@@ -19,6 +19,12 @@
 #include "stb_image.h"
 
 #include "video360.h"
+#include "playercontrol.h"
+
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <system_error>
 
 #ifdef USE_ONLINE_VULKAN_SHADERC
 #include <shaderc/shaderc.hpp>
@@ -1127,19 +1133,107 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // Opens an equirectangular video and sets up the NV12 upload + GPU conversion resources
     // that UpdateVideoTexture uses each frame. Returns false if the file could not be decoded,
     // so the caller can fall back to a still photo.
-    bool OpenVideoTexture(const std::string& path) {
-        if (!m_video.Open(path)) return false;
+    // Frees everything OpenVideoTexture built, in the reverse order it was built, so the next
+    // track can come in at a different resolution. The Video360 goes first: its decode thread
+    // writes into the staging memory, so that memory cannot be unmapped until the thread has
+    // been joined - which is what ~Video360 does.
+    void DestroyVideoResources() {
+        m_video.reset();
+        vkDeviceWaitIdle(m_vkDevice);
 
-        m_panoLayout = ResolvePanoLayout(m_video.DetectedLayout(), path, m_video.Width(), m_video.Height());
-        AnnounceSkybox(path, m_video.Width(), m_video.Height(), m_video.FrameRate(), m_video.CodecName());
+        auto dropPipeline = [this](VkPipeline& h) { if (h) { vkDestroyPipeline(m_vkDevice, h, nullptr); h = VK_NULL_HANDLE; } };
+        auto dropModule = [this](VkShaderModule& h) { if (h) { vkDestroyShaderModule(m_vkDevice, h, nullptr); h = VK_NULL_HANDLE; } };
+        auto dropView = [this](VkImageView& h) { if (h) { vkDestroyImageView(m_vkDevice, h, nullptr); h = VK_NULL_HANDLE; } };
+        auto dropImage = [this](VkImage& h) { if (h) { vkDestroyImage(m_vkDevice, h, nullptr); h = VK_NULL_HANDLE; } };
+        auto dropMemory = [this](VkDeviceMemory& h) { if (h) { vkFreeMemory(m_vkDevice, h, nullptr); h = VK_NULL_HANDLE; } };
+
+        // Conversion pass. The framebuffer references the render pass and the target view, so
+        // it has to go before either of them.
+        if (m_videoConvertFb) { vkDestroyFramebuffer(m_vkDevice, m_videoConvertFb, nullptr); m_videoConvertFb = VK_NULL_HANDLE; }
+        dropPipeline(m_videoConvertPipeline);
+        dropModule(m_videoVertModule);
+        dropModule(m_videoFragModule);
+        if (m_videoConvertPipeLayout) {
+            vkDestroyPipelineLayout(m_vkDevice, m_videoConvertPipeLayout, nullptr);
+            m_videoConvertPipeLayout = VK_NULL_HANDLE;
+        }
+        if (m_videoConvertDescPool) {  // frees m_videoConvertDescSet with it
+            vkDestroyDescriptorPool(m_vkDevice, m_videoConvertDescPool, nullptr);
+            m_videoConvertDescPool = VK_NULL_HANDLE;
+            m_videoConvertDescSet = VK_NULL_HANDLE;
+        }
+        if (m_videoConvertSetLayout) {
+            vkDestroyDescriptorSetLayout(m_vkDevice, m_videoConvertSetLayout, nullptr);
+            m_videoConvertSetLayout = VK_NULL_HANDLE;
+        }
+        if (m_videoConvertPass) { vkDestroyRenderPass(m_vkDevice, m_videoConvertPass, nullptr); m_videoConvertPass = VK_NULL_HANDLE; }
+        dropView(m_videoRgbTargetView);
+        if (m_videoYuvSampler) { vkDestroySampler(m_vkDevice, m_videoYuvSampler, nullptr); m_videoYuvSampler = VK_NULL_HANDLE; }
+
+        // Staging ring. The memory was mapped at creation and never unmapped since.
+        for (size_t i = 0; i < m_videoStaging.size(); i++) {
+            vkDestroyBuffer(m_vkDevice, m_videoStaging[i], nullptr);
+            vkUnmapMemory(m_vkDevice, m_videoStagingMemory[i]);
+            vkFreeMemory(m_vkDevice, m_videoStagingMemory[i], nullptr);
+        }
+        m_videoStaging.clear();
+        m_videoStagingMemory.clear();
+
+        // Y/UV plane images, then the skybox texture itself.
+        dropView(m_videoYView);
+        dropImage(m_videoYImage);
+        dropMemory(m_videoYMemory);
+        dropView(m_videoUVView);
+        dropImage(m_videoUVImage);
+        dropMemory(m_videoUVMemory);
+        DestroySkyboxTexture();
+    }
+
+    void DestroySkyboxTexture() {
+        if (m_photoDescriptorPool) {  // frees m_photoDescriptorSet with it
+            vkDestroyDescriptorPool(m_vkDevice, m_photoDescriptorPool, nullptr);
+            m_photoDescriptorPool = VK_NULL_HANDLE;
+            m_photoDescriptorSet = VK_NULL_HANDLE;
+        }
+        if (m_photoSampler) { vkDestroySampler(m_vkDevice, m_photoSampler, nullptr); m_photoSampler = VK_NULL_HANDLE; }
+        if (m_photoImageView) { vkDestroyImageView(m_vkDevice, m_photoImageView, nullptr); m_photoImageView = VK_NULL_HANDLE; }
+        if (m_photoImage) { vkDestroyImage(m_vkDevice, m_photoImage, nullptr); m_photoImage = VK_NULL_HANDLE; }
+        if (m_photoImageMemory) { vkFreeMemory(m_vkDevice, m_photoImageMemory, nullptr); m_photoImageMemory = VK_NULL_HANDLE; }
+    }
+
+    // Moves to the next file in the playlist, rebuilding everything for its geometry. A file
+    // that will not open is skipped rather than fatal - one bad download should not end
+    // playback - but if none of them open we give up and leave the last good frame on screen.
+    void AdvanceTrack() {
+        const size_t count = m_playlist.size();
+        for (size_t attempt = 0; attempt < count; attempt++) {
+            DestroyVideoResources();
+            m_videoMode = false;
+            m_playlistIndex = (m_playlistIndex + 1) % count;
+            Log::Write(Log::Level::Info, Fmt("playlist: %zu/%zu", m_playlistIndex + 1, count));
+            if (OpenVideoTexture(m_playlist[m_playlistIndex])) return;
+            Log::Write(Log::Level::Warning, Fmt("playlist: skipping '%s'", m_playlist[m_playlistIndex].c_str()));
+        }
+        Log::Write(Log::Level::Error, "playlist: no file in the list could be opened, stopping playback");
+    }
+
+    bool OpenVideoTexture(const std::string& path) {
+        m_video = std::make_unique<Video360>();
+        if (!m_video->Open(path)) return false;
+        // A single file loops forever, as it always has. A real playlist plays each file once
+        // and moves on, wrapping at the end.
+        m_video->SetLoop(m_playlist.size() < 2);
+
+        m_panoLayout = ResolvePanoLayout(m_video->DetectedLayout(), path, m_video->Width(), m_video->Height());
+        AnnounceSkybox(path, m_video->Width(), m_video->Height(), m_video->FrameRate(), m_video->CodecName());
 
         // Cap the mip chain: it is regenerated every frame, and a 4K pano in the eye buffer
         // rarely minifies past level ~5. The full 12-level chain was pure per-frame overhead.
-        CreateSkyboxTexture(m_video.Width(), m_video.Height(), 6);
+        CreateSkyboxTexture(m_video->Width(), m_video->Height(), 6);
 
-        CreateVideoPlaneImage((uint32_t)m_video.Width(), (uint32_t)m_video.Height(), VK_FORMAT_R8_UNORM, &m_videoYImage,
+        CreateVideoPlaneImage((uint32_t)m_video->Width(), (uint32_t)m_video->Height(), VK_FORMAT_R8_UNORM, &m_videoYImage,
                               &m_videoYMemory, &m_videoYView);
-        CreateVideoPlaneImage((uint32_t)m_video.Width() / 2, (uint32_t)m_video.Height() / 2, VK_FORMAT_R8G8_UNORM,
+        CreateVideoPlaneImage((uint32_t)m_video->Width() / 2, (uint32_t)m_video->Height() / 2, VK_FORMAT_R8G8_UNORM,
                               &m_videoUVImage, &m_videoUVMemory, &m_videoUVView);
 
         // A ring of staging buffers, each mapped once and never unmapped, handed to the decoder
@@ -1149,8 +1243,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         //
         // This replaced a single buffer plus a per-frame memcpy from decoder-owned memory,
         // which cost 8.9 ms of render-thread time per 8K frame - over half a 60Hz budget.
-        m_videoUVOffset = (VkDeviceSize)((m_video.YBytes() + 255) & ~size_t(255));
-        const VkDeviceSize stagingSize = m_videoUVOffset + (VkDeviceSize)m_video.UVBytes();
+        m_videoUVOffset = (VkDeviceSize)((m_video->YBytes() + 255) & ~size_t(255));
+        const VkDeviceSize stagingSize = m_videoUVOffset + (VkDeviceSize)m_video->UVBytes();
 
         std::vector<Video360Buffer> frameBuffers;
         for (size_t i = 0; i < Video360::kFrameBuffers; i++) {
@@ -1177,12 +1271,17 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                                          (size_t)Video360::kFrameBuffers, stagingSize / (1024.0 * 1024.0),
                                          Video360::kFrameBuffers * stagingSize / (1024.0 * 1024.0)));
 
-        m_video.SetFrameBuffers(std::move(frameBuffers));
+        m_video->SetFrameBuffers(std::move(frameBuffers));
 
         CreateVideoConvertResources();
 
         // Clear to black so the first frames have something valid to sample: the image is still
         // in UNDEFINED layout, and the decoder needs a moment before its first frame is due.
+        //
+        // Clear() first, not just Begin(): on the very first call the command buffer is freshly
+        // Initialized, but when a playlist advances we arrive here straight out of a rendered
+        // frame with the buffer still Executable, and Begin() asserts on that.
+        m_cmdBuffer.Clear();
         m_cmdBuffer.Begin();
         VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1213,7 +1312,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_cmdBuffer.Clear();
 
         // Everything the decoder writes into now exists, so let it run.
-        if (!m_video.Start()) return false;
+        if (!m_video->Start()) return false;
 
         m_videoMode = true;
         return true;
@@ -1223,7 +1322,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // into the skybox texture, and regenerates its mip chain. Cheap to call when nothing is
     // due - the decoder returns null and this becomes a no-op.
     void UpdateVideoTexture() {
-        const int slot = m_video.AcquireCurrentSlot();
+        const int slot = m_video->AcquireCurrentSlot();
         if (slot < 0) return;
         const VkBuffer staging = m_videoStaging[slot];
 
@@ -1298,7 +1397,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         vkCmdBindPipeline(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_videoConvertPipeline);
         vkCmdBindDescriptorSets(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_videoConvertPipeLayout, 0, 1,
                                 &m_videoConvertDescSet, 0, nullptr);
-        const int32_t pushFlags[4] = {m_video.FullRange() ? 1 : 0, m_video.Bt709() ? 1 : 0, 0, 0};
+        const int32_t pushFlags[4] = {m_video->FullRange() ? 1 : 0, m_video->Bt709() ? 1 : 0, 0, 0};
         vkCmdPushConstants(m_cmdBuffer.buf, m_videoConvertPipeLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushFlags),
                            pushFlags);
         vkCmdDraw(m_cmdBuffer.buf, 3, 1, 0, 0);
@@ -1330,7 +1429,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 const double secs = std::chrono::duration<double>(now - windowStart).count();
                 Log::Write(Log::Level::Info, Fmt("video upload: %.1f frames/s to the skybox (file is %.1f) | "
                                                  "render thread %.2f ms mean, %.2f ms max - gpu copy+convert+mips",
-                                                 uploads / secs, m_video.FrameRate(), sumMs / uploads, maxMs));
+                                                 uploads / secs, m_video->FrameRate(), sumMs / uploads, maxMs));
                 uploads = 0;
                 sumMs = maxMs = 0.0;
                 windowStart = now;
@@ -1354,11 +1453,57 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                        (slash == std::string::npos ? path : path.substr(slash + 1)).c_str()));
     }
 
-    // HELLO_XR_VIDEO360 wins over HELLO_XR_PHOTO360 when both are set.
+    // Builds the play order. A plain file is a one-entry list; a directory becomes every video
+    // in it, sorted by name so the order is predictable and repeatable rather than whatever
+    // the filesystem happens to hand back.
+    void BuildPlaylist(const std::string& path) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(path, ec)) {
+            m_playlist.push_back(path);
+            return;
+        }
+
+        static const char* kExtensions[] = {".mp4", ".m4v", ".mkv", ".mov", ".webm", ".avi", ".ts", ".mpg", ".mpeg"};
+        for (const auto& entry : std::filesystem::directory_iterator(path, ec)) {
+            if (!entry.is_regular_file(ec)) continue;
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+            for (const char* known : kExtensions) {
+                if (ext == known) {
+                    m_playlist.push_back(entry.path().string());
+                    break;
+                }
+            }
+        }
+        std::sort(m_playlist.begin(), m_playlist.end());
+
+        if (m_playlist.empty()) {
+            Log::Write(Log::Level::Warning, Fmt("playlist: no video files in '%s'", path.c_str()));
+            return;
+        }
+        Log::Write(Log::Level::Info, Fmt("playlist: %zu video%s in '%s'", m_playlist.size(),
+                                         m_playlist.size() == 1 ? "" : "s", path.c_str()));
+        for (size_t i = 0; i < m_playlist.size(); i++) {
+            const std::string& p = m_playlist[i];
+            const size_t slash = p.find_last_of('/');
+            Log::Write(Log::Level::Info,
+                       Fmt("  %2zu. %s", i + 1, (slash == std::string::npos ? p : p.substr(slash + 1)).c_str()));
+        }
+    }
+
+    // HELLO_XR_VIDEO360 wins over HELLO_XR_PHOTO360 when both are set. It may name a single
+    // file or a directory to play through.
     void InitSkybox() {
         const char* videoPath = getenv("HELLO_XR_VIDEO360");
         if (videoPath != nullptr && videoPath[0] != '\0') {
-            if (OpenVideoTexture(videoPath)) return;
+            BuildPlaylist(videoPath);
+            for (size_t attempt = 0; attempt < m_playlist.size(); attempt++) {
+                if (OpenVideoTexture(m_playlist[m_playlistIndex])) return;
+                Log::Write(Log::Level::Warning, Fmt("playlist: skipping '%s'", m_playlist[m_playlistIndex].c_str()));
+                DestroyVideoResources();
+                m_playlistIndex = (m_playlistIndex + 1) % m_playlist.size();
+            }
+            m_playlist.clear();
             Log::Write(Log::Level::Warning, "video360: falling back to the still photo skybox");
         }
         LoadPhotoTexture();
@@ -1517,7 +1662,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // so swapping the texture between them would show each eye a different instant in
         // time. This also halves the per-frame upload and mip-generation cost.
         if (m_videoMode && eye == 0) {
-            UpdateVideoTexture();
+            // End of the track: rebuild everything for the next file. This is a hitch - a full
+            // device idle plus reallocation - but it only happens between videos, and the next
+            // file may have a different resolution, so there is nothing to reuse.
+            m_video->SetRate(PlayerControl::Rate());
+            const bool skip = PlayerControl::TakeNextTrackRequest() && m_playlist.size() > 1;
+            if (skip || (m_playlist.size() > 1 && m_video->Finished())) AdvanceTrack();
+            if (m_videoMode) UpdateVideoTexture();
         }
 
         VulkanSwapchainImageData* swapchainData;
@@ -1700,8 +1851,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     int m_texHeight{0};
     uint32_t m_texMipLevels{1};
 
-    Video360 m_video;
+    // Recreated per playlist track: a new file can have a different resolution, codec and
+    // projection, so everything downstream of it has to be rebuilt too.
+    std::unique_ptr<Video360> m_video;
     bool m_videoMode{false};
+
+    // Files to play back to back. One entry (or a single file given directly) loops forever;
+    // several play in turn and wrap around at the end.
+    std::vector<std::string> m_playlist;
+    size_t m_playlistIndex{0};
     // One staging buffer per decoder frame slot; index with what AcquireCurrentSlot() returns.
     std::vector<VkBuffer> m_videoStaging;
     std::vector<VkDeviceMemory> m_videoStagingMemory;
