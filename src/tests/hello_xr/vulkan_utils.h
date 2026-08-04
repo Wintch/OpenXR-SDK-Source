@@ -944,7 +944,7 @@ struct VulkanUniformBuffer {
 struct PipelineLayout {
     VkPipelineLayout layout{VK_NULL_HANDLE};
 
-    // only set for compute pipelines
+    // set for compute pipelines, and for the graphics equirect-sampler pipeline
     VkDescriptorSetLayout descriptorSetLayout{VK_NULL_HANDLE};
 
     PipelineLayout() = default;
@@ -968,13 +968,27 @@ struct PipelineLayout {
         m_vkDevice = device;
         switch (programType) {
             case SHADER_PROGRAM_TYPE_GRAPHICS: {
-                // MVP matrix is a push_constant
+                // invViewProj matrix + eye position are a push_constant, read in both stages
                 VkPushConstantRange pcr = {};
-                pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+                pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
                 pcr.offset = 0;
                 pcr.size = sizeof(VulkanUniformBuffer);
 
+                // Single combined image sampler for the equirect photo texture.
+                VkDescriptorSetLayoutBinding samplerBinding{};
+                samplerBinding.binding = 0;
+                samplerBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                samplerBinding.descriptorCount = 1;
+                samplerBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+                VkDescriptorSetLayoutCreateInfo descriptorSetLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+                descriptorSetLayoutInfo.bindingCount = 1;
+                descriptorSetLayoutInfo.pBindings = &samplerBinding;
+                XRC_CHECK_THROW_VKCMD(vkCreateDescriptorSetLayout(m_vkDevice, &descriptorSetLayoutInfo, nullptr, &descriptorSetLayout));
+
                 VkPipelineLayoutCreateInfo pipelineLayoutCreateInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+                pipelineLayoutCreateInfo.setLayoutCount = 1;
+                pipelineLayoutCreateInfo.pSetLayouts = &descriptorSetLayout;
                 pipelineLayoutCreateInfo.pushConstantRangeCount = 1;
                 pipelineLayoutCreateInfo.pPushConstantRanges = &pcr;
                 XRC_CHECK_THROW_VKCMD(vkCreatePipelineLayout(m_vkDevice, &pipelineLayoutCreateInfo, nullptr, &layout));
@@ -1045,7 +1059,9 @@ struct Pipeline {
 
         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode = VK_CULL_MODE_BACK_BIT;
+        // No culling: the 360-photo fullscreen triangle's winding isn't worth
+        // getting exactly right, and no validation layer is present to catch it.
+        rs.cullMode = VK_CULL_MODE_NONE;
         rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
         rs.depthClampEnable = VK_FALSE;
         rs.rasterizerDiscardEnable = VK_FALSE;

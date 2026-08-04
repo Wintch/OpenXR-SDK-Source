@@ -15,6 +15,11 @@
 #include <common/xr_linear.h>
 #include "vulkan_utils.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+#include "video360.h"
+
 #ifdef USE_ONLINE_VULKAN_SHADERC
 #include <shaderc/shaderc.hpp>
 #endif
@@ -38,20 +43,15 @@ namespace {
 using nonstd::span;
 
 #ifdef USE_ONLINE_VULKAN_SHADERC
+// Draws a fullscreen triangle (no vertex/index buffer) and, in the fragment
+// shader, reconstructs the per-pixel view ray from the inverse view-projection
+// matrix to sample an equirectangular 360 photo as a skybox.
 constexpr char VertexShaderGlsl[] =
     R"_(
     #version 430
     #extension GL_ARB_separate_shader_objects : enable
 
-    layout (std140, push_constant) uniform buf
-    {
-        mat4 mvp;
-    } ubuf;
-
-    layout (location = 0) in vec3 Position;
-    layout (location = 1) in vec3 Color;
-
-    layout (location = 0) out vec4 oColor;
+    layout (location = 0) out vec2 oNdc;
     out gl_PerVertex
     {
         vec4 gl_Position;
@@ -59,8 +59,9 @@ constexpr char VertexShaderGlsl[] =
 
     void main()
     {
-        oColor.rgba  = Color.rgba;
-        gl_Position = ubuf.mvp * Position;
+        vec2 pos[3] = vec2[](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+        oNdc = pos[gl_VertexIndex];
+        gl_Position = vec4(oNdc, 0.0, 1.0);
     }
 )_";
 
@@ -68,14 +69,28 @@ constexpr char FragmentShaderGlsl[] =
     R"_(
     #version 430
     #extension GL_ARB_separate_shader_objects : enable
+    #define PI 3.14159265359
 
-    layout (location = 0) in vec4 oColor;
+    layout (std140, push_constant) uniform buf
+    {
+        mat4 invViewProj;
+        vec4 eyePos;
+    } ubuf;
 
+    layout (set = 0, binding = 0) uniform sampler2D equirectTex;
+
+    layout (location = 0) in vec2 iNdc;
     layout (location = 0) out vec4 FragColor;
 
     void main()
     {
-        FragColor = oColor;
+        vec4 worldPos = ubuf.invViewProj * vec4(iNdc, 1.0, 1.0);
+        worldPos /= worldPos.w;
+        vec3 dir = normalize(worldPos.xyz - ubuf.eyePos.xyz);
+
+        float u = atan(dir.x, -dir.z) / (2.0 * PI) + 0.5;
+        float v = acos(clamp(dir.y, -1.0, 1.0)) / PI;
+        FragColor = texture(equirectTex, vec2(u, v));
     }
 )_";
 #endif  // USE_ONLINE_VULKAN_SHADERC
@@ -682,6 +697,631 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     }
 #endif
 
+    // Creates m_photoImage plus everything needed to sample it: view, sampler, descriptor set.
+    // A full mip chain is mandatory - an 8k-wide panorama sampled at eye-buffer resolution is
+    // heavily minified, and without mips that aliases into flashing, blocky noise. Video passes
+    // a mipCap since it regenerates the chain every frame and rarely minifies past ~6 levels.
+    //
+    // The image is sRGB: photos and decoded video both hold gamma-encoded bytes, and sampling
+    // through an sRGB view is what makes filtering/lighting math correct against the sRGB
+    // swapchain (the previous UNORM format double-encoded and washed the image out).
+    // MUTABLE_FORMAT is needed so the video path can render into a UNORM view of level 0.
+    void CreateSkyboxTexture(int width, int height, uint32_t mipCap = 0) {
+        m_texWidth = width;
+        m_texHeight = height;
+        m_texMipLevels = (uint32_t)std::floor(std::log2((double)std::max(width, height))) + 1;
+        if (mipCap > 0 && m_texMipLevels > mipCap) m_texMipLevels = mipCap;
+
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        imageInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+        imageInfo.extent = {(uint32_t)width, (uint32_t)height, 1};
+        imageInfo.mipLevels = m_texMipLevels;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        XRC_CHECK_THROW_VKCMD(vkCreateImage(m_vkDevice, &imageInfo, nullptr, &m_photoImage));
+
+        VkMemoryRequirements memReq{};
+        vkGetImageMemoryRequirements(m_vkDevice, m_photoImage, &memReq);
+        m_memAllocator.Allocate(memReq, &m_photoImageMemory, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_vkDevice, m_photoImage, m_photoImageMemory, 0));
+
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = m_photoImage;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, m_texMipLevels, 0, 1};
+        XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &viewInfo, nullptr, &m_photoImageView));
+
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;  // wraps around the horizon
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;  // poles
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+        samplerInfo.maxLod = (float)m_texMipLevels;
+        XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_vkDevice, &samplerInfo, nullptr, &m_photoSampler));
+
+        VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        XRC_CHECK_THROW_VKCMD(vkCreateDescriptorPool(m_vkDevice, &poolInfo, nullptr, &m_photoDescriptorPool));
+
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = m_photoDescriptorPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &m_pipelineLayout.descriptorSetLayout;
+        XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_vkDevice, &allocInfo, &m_photoDescriptorSet));
+
+        VkDescriptorImageInfo descImageInfo{};
+        descImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        descImageInfo.imageView = m_photoImageView;
+        descImageInfo.sampler = m_photoSampler;
+
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = m_photoDescriptorSet;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &descImageInfo;
+        vkUpdateDescriptorSets(m_vkDevice, 1, &write, 0, nullptr);
+    }
+
+    // Blit-downsamples level 0 into every successive mip level. Level 0 must already hold its
+    // content and be in TRANSFER_DST_OPTIMAL; on return every level is in SHADER_READ_ONLY_OPTIMAL.
+    // The caller owns Begin()/End()/Exec() on m_cmdBuffer.
+    void RecordGenerateMips() {
+        int32_t mipWidth = m_texWidth, mipHeight = m_texHeight;
+        for (uint32_t i = 1; i < m_texMipLevels; i++) {
+            VkImageMemoryBarrier srcBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            srcBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            srcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            srcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            srcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            srcBarrier.image = m_photoImage;
+            srcBarrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 1, 0, 1};
+            srcBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            srcBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                nullptr, 0, nullptr, 1, &srcBarrier);
+
+            int32_t nextWidth = mipWidth > 1 ? mipWidth / 2 : 1;
+            int32_t nextHeight = mipHeight > 1 ? mipHeight / 2 : 1;
+            VkImageBlit blit{};
+            blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i - 1, 0, 1};
+            blit.srcOffsets[1] = {mipWidth, mipHeight, 1};
+            blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+            blit.dstOffsets[1] = {nextWidth, nextHeight, 1};
+            vkCmdBlitImage(m_cmdBuffer.buf, m_photoImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_photoImage,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+            VkImageMemoryBarrier toShaderReadPrev = srcBarrier;
+            toShaderReadPrev.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toShaderReadPrev.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            toShaderReadPrev.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            toShaderReadPrev.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                                nullptr, 0, nullptr, 1, &toShaderReadPrev);
+
+            mipWidth = nextWidth;
+            mipHeight = nextHeight;
+        }
+
+        VkImageMemoryBarrier toShaderReadLast{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toShaderReadLast.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toShaderReadLast.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toShaderReadLast.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toShaderReadLast.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toShaderReadLast.image = m_photoImage;
+        toShaderReadLast.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, m_texMipLevels - 1, 1, 0, 1};
+        toShaderReadLast.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toShaderReadLast.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                            nullptr, 0, nullptr, 1, &toShaderReadLast);
+    }
+
+    // Loads an equirectangular JPG/PNG into m_photoImage, for use as a 360 photo skybox.
+    void LoadPhotoTexture() {
+        const char* envPath = getenv("HELLO_XR_PHOTO360");
+        std::string photoPath = envPath && envPath[0] ? envPath
+                                                       : (std::string(getenv("HOME")) + "/Documents/linux_vr_base/photo360/venice_sunset.jpg");
+
+        int width, height, channels;
+        stbi_uc* pixels = stbi_load(photoPath.c_str(), &width, &height, &channels, STBI_rgb_alpha);
+        if (!pixels) THROW(Fmt("Failed to load 360 photo '%s': %s", photoPath.c_str(), stbi_failure_reason()));
+        Log::Write(Log::Level::Info, Fmt("Loaded 360 photo '%s' (%dx%d)", photoPath.c_str(), width, height));
+
+        VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
+
+        // Staging buffer holding the raw pixels, host-visible so we can memcpy into it.
+        VkBuffer stagingBuffer{VK_NULL_HANDLE};
+        VkDeviceMemory stagingMemory{VK_NULL_HANDLE};
+        {
+            VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bufInfo.size = imageSize;
+            bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            XRC_CHECK_THROW_VKCMD(vkCreateBuffer(m_vkDevice, &bufInfo, nullptr, &stagingBuffer));
+
+            VkMemoryRequirements memReq{};
+            vkGetBufferMemoryRequirements(m_vkDevice, stagingBuffer, &memReq);
+            m_memAllocator.Allocate(memReq, &stagingMemory);
+            XRC_CHECK_THROW_VKCMD(vkBindBufferMemory(m_vkDevice, stagingBuffer, stagingMemory, 0));
+
+            void* data;
+            XRC_CHECK_THROW_VKCMD(vkMapMemory(m_vkDevice, stagingMemory, 0, imageSize, 0, &data));
+            memcpy(data, pixels, (size_t)imageSize);
+            vkUnmapMemory(m_vkDevice, stagingMemory);
+        }
+        stbi_image_free(pixels);
+
+        CreateSkyboxTexture(width, height);
+
+        // Upload the base level, then blit-downsample it into each successive mip level.
+        m_cmdBuffer.Begin();
+
+        VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.image = m_photoImage;
+        toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, m_texMipLevels, 0, 1};
+        toDst.srcAccessMask = 0;
+        toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                            nullptr, 0, nullptr, 1, &toDst);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {(uint32_t)width, (uint32_t)height, 1};
+        vkCmdCopyBufferToImage(m_cmdBuffer.buf, stagingBuffer, m_photoImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        RecordGenerateMips();
+
+        m_cmdBuffer.End();
+        m_cmdBuffer.Exec(m_vkQueue);
+        m_cmdBuffer.Wait();
+        m_cmdBuffer.Clear();
+
+        vkDestroyBuffer(m_vkDevice, stagingBuffer, nullptr);
+        vkFreeMemory(m_vkDevice, stagingMemory, nullptr);
+    }
+
+    // Creates one of the NV12 plane textures (Y as R8, interleaved CbCr as R8G8) that the
+    // decoder output is uploaded into each frame, for sampling by the conversion pass.
+    void CreateVideoPlaneImage(uint32_t width, uint32_t height, VkFormat format, VkImage* image, VkDeviceMemory* memory,
+                               VkImageView* view) {
+        VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = format;
+        imageInfo.extent = {width, height, 1};
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        XRC_CHECK_THROW_VKCMD(vkCreateImage(m_vkDevice, &imageInfo, nullptr, image));
+
+        VkMemoryRequirements memReq{};
+        vkGetImageMemoryRequirements(m_vkDevice, *image, &memReq);
+        m_memAllocator.Allocate(memReq, memory, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        XRC_CHECK_THROW_VKCMD(vkBindImageMemory(m_vkDevice, *image, *memory, 0));
+
+        VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = *image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = format;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &viewInfo, nullptr, view));
+    }
+
+    // Builds the NV12 -> RGB conversion pass: a fullscreen triangle (reusing the skybox vertex
+    // shader) that samples the Y/UV plane textures and renders into a UNORM view of the skybox
+    // texture's level 0. Rendering through UNORM is deliberate: the shader outputs
+    // gamma-encoded R'G'B', which must be stored raw so the skybox's sRGB sampling view
+    // linearizes it exactly once (see yuv_frag.glsl).
+    void CreateVideoConvertResources() {
+        // UNORM alias of the skybox texture's level 0 (the image is MUTABLE_FORMAT sRGB).
+        VkImageViewCreateInfo targetViewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        targetViewInfo.image = m_photoImage;
+        targetViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        targetViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        targetViewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        XRC_CHECK_THROW_VKCMD(vkCreateImageView(m_vkDevice, &targetViewInfo, nullptr, &m_videoRgbTargetView));
+
+        // Linear sampling: Y is sampled 1:1 but CbCr is quarter-res and needs the upsample.
+        VkSamplerCreateInfo samplerInfo{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        XRC_CHECK_THROW_VKCMD(vkCreateSampler(m_vkDevice, &samplerInfo, nullptr, &m_videoYuvSampler));
+
+        // Render pass: single color attachment, ends in TRANSFER_DST_OPTIMAL so the mip chain
+        // regeneration can consume level 0 without an extra barrier.
+        VkAttachmentDescription att{};
+        att.format = VK_FORMAT_R8G8B8A8_UNORM;
+        att.samples = VK_SAMPLE_COUNT_1_BIT;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+        VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+
+        VkSubpassDependency deps[2]{};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        deps[0].dstSubpass = 0;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;  // previous skybox sampling
+        deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0;
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;  // mip blits
+        deps[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        VkRenderPassCreateInfo rpInfo{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        rpInfo.attachmentCount = 1;
+        rpInfo.pAttachments = &att;
+        rpInfo.subpassCount = 1;
+        rpInfo.pSubpasses = &subpass;
+        rpInfo.dependencyCount = 2;
+        rpInfo.pDependencies = deps;
+        XRC_CHECK_THROW_VKCMD(vkCreateRenderPass(m_vkDevice, &rpInfo, nullptr, &m_videoConvertPass));
+
+        VkFramebufferCreateInfo fbInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fbInfo.renderPass = m_videoConvertPass;
+        fbInfo.attachmentCount = 1;
+        fbInfo.pAttachments = &m_videoRgbTargetView;
+        fbInfo.width = (uint32_t)m_texWidth;
+        fbInfo.height = (uint32_t)m_texHeight;
+        fbInfo.layers = 1;
+        XRC_CHECK_THROW_VKCMD(vkCreateFramebuffer(m_vkDevice, &fbInfo, nullptr, &m_videoConvertFb));
+
+        // Descriptor set: Y at binding 0, interleaved CbCr at binding 1.
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        for (uint32_t i = 0; i < 2; i++) {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo setLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        setLayoutInfo.bindingCount = 2;
+        setLayoutInfo.pBindings = bindings;
+        XRC_CHECK_THROW_VKCMD(vkCreateDescriptorSetLayout(m_vkDevice, &setLayoutInfo, nullptr, &m_videoConvertSetLayout));
+
+        VkPushConstantRange pushRange{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 * sizeof(int32_t)};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &m_videoConvertSetLayout;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &pushRange;
+        XRC_CHECK_THROW_VKCMD(vkCreatePipelineLayout(m_vkDevice, &layoutInfo, nullptr, &m_videoConvertPipeLayout));
+
+        VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        XRC_CHECK_THROW_VKCMD(vkCreateDescriptorPool(m_vkDevice, &poolInfo, nullptr, &m_videoConvertDescPool));
+
+        VkDescriptorSetAllocateInfo allocInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        allocInfo.descriptorPool = m_videoConvertDescPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &m_videoConvertSetLayout;
+        XRC_CHECK_THROW_VKCMD(vkAllocateDescriptorSets(m_vkDevice, &allocInfo, &m_videoConvertDescSet));
+
+        VkDescriptorImageInfo yInfo{m_videoYuvSampler, m_videoYView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo uvInfo{m_videoYuvSampler, m_videoUVView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet writes[2]{};
+        for (uint32_t i = 0; i < 2; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = m_videoConvertDescSet;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        }
+        writes[0].pImageInfo = &yInfo;
+        writes[1].pImageInfo = &uvInfo;
+        vkUpdateDescriptorSets(m_vkDevice, 2, writes, 0, nullptr);
+
+        // Pipeline: fullscreen triangle (shared vert.glsl, no vertex inputs) + yuv_frag.glsl.
+        std::vector<uint32_t> vertSPIRV = SPV_PREFIX
+#include "vert.spv"
+            SPV_SUFFIX;
+        std::vector<uint32_t> yuvSPIRV = SPV_PREFIX
+#include "yuv_frag.spv"
+            SPV_SUFFIX;
+
+        auto makeModule = [this](const std::vector<uint32_t>& code) {
+            VkShaderModuleCreateInfo modInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            modInfo.codeSize = code.size() * sizeof(uint32_t);
+            modInfo.pCode = code.data();
+            VkShaderModule mod{VK_NULL_HANDLE};
+            XRC_CHECK_THROW_VKCMD(vkCreateShaderModule(m_vkDevice, &modInfo, nullptr, &mod));
+            return mod;
+        };
+        m_videoVertModule = makeModule(vertSPIRV);
+        m_videoFragModule = makeModule(yuvSPIRV);
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = m_videoVertModule;
+        stages[0].pName = "main";
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = m_videoFragModule;
+        stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkViewport viewport{0, 0, (float)m_texWidth, (float)m_texHeight, 0, 1};
+        VkRect2D scissor{{0, 0}, {(uint32_t)m_texWidth, (uint32_t)m_texHeight}};
+        VkPipelineViewportStateCreateInfo viewportState{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewportState.viewportCount = 1;
+        viewportState.pViewports = &viewport;
+        viewportState.scissorCount = 1;
+        viewportState.pScissors = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.cullMode = VK_CULL_MODE_NONE;
+        raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        raster.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineColorBlendAttachmentState blendAtt{};
+        blendAtt.colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        blend.attachmentCount = 1;
+        blend.pAttachments = &blendAtt;
+
+        VkGraphicsPipelineCreateInfo pipeInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        pipeInfo.stageCount = 2;
+        pipeInfo.pStages = stages;
+        pipeInfo.pVertexInputState = &vertexInput;
+        pipeInfo.pInputAssemblyState = &inputAssembly;
+        pipeInfo.pViewportState = &viewportState;
+        pipeInfo.pRasterizationState = &raster;
+        pipeInfo.pMultisampleState = &multisample;
+        pipeInfo.pColorBlendState = &blend;
+        pipeInfo.layout = m_videoConvertPipeLayout;
+        pipeInfo.renderPass = m_videoConvertPass;
+        pipeInfo.subpass = 0;
+        XRC_CHECK_THROW_VKCMD(vkCreateGraphicsPipelines(m_vkDevice, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_videoConvertPipeline));
+    }
+
+    // Opens an equirectangular video and sets up the NV12 upload + GPU conversion resources
+    // that UpdateVideoTexture uses each frame. Returns false if the file could not be decoded,
+    // so the caller can fall back to a still photo.
+    bool OpenVideoTexture(const std::string& path) {
+        if (!m_video.Open(path)) return false;
+
+        // Cap the mip chain: it is regenerated every frame, and a 4K pano in the eye buffer
+        // rarely minifies past level ~5. The full 12-level chain was pure per-frame overhead.
+        CreateSkyboxTexture(m_video.Width(), m_video.Height(), 6);
+
+        CreateVideoPlaneImage((uint32_t)m_video.Width(), (uint32_t)m_video.Height(), VK_FORMAT_R8_UNORM, &m_videoYImage,
+                              &m_videoYMemory, &m_videoYView);
+        CreateVideoPlaneImage((uint32_t)m_video.Width() / 2, (uint32_t)m_video.Height() / 2, VK_FORMAT_R8G8_UNORM,
+                              &m_videoUVImage, &m_videoUVMemory, &m_videoUVView);
+
+        // One staging buffer for the whole run, mapped once and never unmapped. NV12 is
+        // 1.5 bytes/pixel - ~12MB at 4K vs the 32MB the old RGBA path pushed per frame.
+        m_videoUVOffset = (VkDeviceSize)((m_video.YBytes() + 255) & ~size_t(255));
+        VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bufInfo.size = m_videoUVOffset + (VkDeviceSize)m_video.UVBytes();
+        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        XRC_CHECK_THROW_VKCMD(vkCreateBuffer(m_vkDevice, &bufInfo, nullptr, &m_videoStaging));
+
+        VkMemoryRequirements memReq{};
+        vkGetBufferMemoryRequirements(m_vkDevice, m_videoStaging, &memReq);
+        m_memAllocator.Allocate(memReq, &m_videoStagingMemory);
+        XRC_CHECK_THROW_VKCMD(vkBindBufferMemory(m_vkDevice, m_videoStaging, m_videoStagingMemory, 0));
+        XRC_CHECK_THROW_VKCMD(vkMapMemory(m_vkDevice, m_videoStagingMemory, 0, bufInfo.size, 0, &m_videoStagingMapped));
+
+        CreateVideoConvertResources();
+
+        // Clear to black so the first frames have something valid to sample: the image is still
+        // in UNDEFINED layout, and the decoder needs a moment before its first frame is due.
+        m_cmdBuffer.Begin();
+        VkImageMemoryBarrier toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toDst.image = m_photoImage;
+        toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, m_texMipLevels, 0, 1};
+        toDst.srcAccessMask = 0;
+        toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                            nullptr, 0, nullptr, 1, &toDst);
+
+        VkClearColorValue black{};
+        VkImageSubresourceRange allLevels{VK_IMAGE_ASPECT_COLOR_BIT, 0, m_texMipLevels, 0, 1};
+        vkCmdClearColorImage(m_cmdBuffer.buf, m_photoImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &allLevels);
+
+        VkImageMemoryBarrier toShaderRead = toDst;
+        toShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                            nullptr, 0, nullptr, 1, &toShaderRead);
+        m_cmdBuffer.End();
+        m_cmdBuffer.Exec(m_vkQueue);
+        m_cmdBuffer.Wait();
+        m_cmdBuffer.Clear();
+
+        m_videoMode = true;
+        return true;
+    }
+
+    // Uploads the NV12 frame that is due now (if any), runs the GPU YUV->RGB conversion pass
+    // into the skybox texture, and regenerates its mip chain. Cheap to call when nothing is
+    // due - the decoder returns null and this becomes a no-op.
+    void UpdateVideoTexture() {
+        const Video360Frame* frame = m_video.AcquireCurrentFrame();
+        if (frame == nullptr) return;
+
+        const bool stats = getenv("HELLO_XR_VIDEO_STATS") != nullptr;
+        const auto uploadStart = std::chrono::steady_clock::now();
+
+        memcpy(m_videoStagingMapped, frame->y, m_video.YBytes());
+        memcpy((uint8_t*)m_videoStagingMapped + m_videoUVOffset, frame->uv, m_video.UVBytes());
+        const auto copyDone = std::chrono::steady_clock::now();
+
+        m_cmdBuffer.Clear();
+        m_cmdBuffer.Begin();
+
+        // Y/UV plane textures: UNDEFINED is fine as oldLayout, they are fully overwritten.
+        VkImageMemoryBarrier planeToDst[2]{};
+        VkImage planeImages[2] = {m_videoYImage, m_videoUVImage};
+        for (int i = 0; i < 2; i++) {
+            planeToDst[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            planeToDst[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            planeToDst[i].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            planeToDst[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            planeToDst[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            planeToDst[i].image = planeImages[i];
+            planeToDst[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            planeToDst[i].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            planeToDst[i].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        }
+        vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                            nullptr, 0, nullptr, 2, planeToDst);
+
+        VkBufferImageCopy yRegion{};
+        yRegion.bufferOffset = 0;
+        yRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        yRegion.imageExtent = {(uint32_t)m_texWidth, (uint32_t)m_texHeight, 1};
+        vkCmdCopyBufferToImage(m_cmdBuffer.buf, m_videoStaging, m_videoYImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &yRegion);
+
+        VkBufferImageCopy uvRegion{};
+        uvRegion.bufferOffset = m_videoUVOffset;
+        uvRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        uvRegion.imageExtent = {(uint32_t)m_texWidth / 2, (uint32_t)m_texHeight / 2, 1};
+        vkCmdCopyBufferToImage(m_cmdBuffer.buf, m_videoStaging, m_videoUVImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &uvRegion);
+
+        VkImageMemoryBarrier planeToRead[2];
+        for (int i = 0; i < 2; i++) {
+            planeToRead[i] = planeToDst[i];
+            planeToRead[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            planeToRead[i].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            planeToRead[i].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            planeToRead[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        }
+        vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                            nullptr, 0, nullptr, 2, planeToRead);
+
+        // Mip levels 1..N of the skybox texture will be blit targets; level 0 is handled by the
+        // render pass itself (UNDEFINED -> COLOR_ATTACHMENT -> TRANSFER_DST via finalLayout).
+        if (m_texMipLevels > 1) {
+            VkImageMemoryBarrier mipsToDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            mipsToDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            mipsToDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            mipsToDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mipsToDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            mipsToDst.image = m_photoImage;
+            mipsToDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 1, m_texMipLevels - 1, 0, 1};
+            mipsToDst.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            mipsToDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(m_cmdBuffer.buf, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                                nullptr, 0, nullptr, 1, &mipsToDst);
+        }
+
+        // YUV -> RGB conversion pass into level 0.
+        VkRenderPassBeginInfo rpBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rpBegin.renderPass = m_videoConvertPass;
+        rpBegin.framebuffer = m_videoConvertFb;
+        rpBegin.renderArea = {{0, 0}, {(uint32_t)m_texWidth, (uint32_t)m_texHeight}};
+        vkCmdBeginRenderPass(m_cmdBuffer.buf, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_videoConvertPipeline);
+        vkCmdBindDescriptorSets(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_videoConvertPipeLayout, 0, 1,
+                                &m_videoConvertDescSet, 0, nullptr);
+        const int32_t pushFlags[4] = {m_video.FullRange() ? 1 : 0, m_video.Bt709() ? 1 : 0, 0, 0};
+        vkCmdPushConstants(m_cmdBuffer.buf, m_videoConvertPipeLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pushFlags),
+                           pushFlags);
+        vkCmdDraw(m_cmdBuffer.buf, 3, 1, 0, 0);
+        vkCmdEndRenderPass(m_cmdBuffer.buf);
+
+        RecordGenerateMips();
+
+        m_cmdBuffer.End();
+        m_cmdBuffer.Exec(m_vkQueue);
+        m_cmdBuffer.Wait();
+        m_cmdBuffer.Clear();
+
+        // HELLO_XR_VIDEO_STATS=1: how many frames actually reached the screen, and what the
+        // staging copy + mip chain cost. If the upload rate sits below the file's frame rate,
+        // the decoder is not keeping up and playback is dropping frames.
+        if (stats) {
+            static uint64_t uploads = 0;
+            static double sumMs = 0.0, maxMs = 0.0, sumCopyMs = 0.0;
+            static auto windowStart = std::chrono::steady_clock::now();
+
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - uploadStart).count();
+            sumCopyMs += std::chrono::duration<double, std::milli>(copyDone - uploadStart).count();
+            sumMs += ms;
+            if (ms > maxMs) maxMs = ms;
+
+            if (++uploads >= 60) {
+                const double secs = std::chrono::duration<double>(now - windowStart).count();
+                Log::Write(Log::Level::Info,
+                           Fmt("video stats: %.1f frames/s uploaded | total mean %.2f ms max %.2f ms "
+                               "(staging memcpy %.2f ms, gpu copy+mips %.2f ms)",
+                               uploads / secs, sumMs / uploads, maxMs, sumCopyMs / uploads, (sumMs - sumCopyMs) / uploads));
+                uploads = 0;
+                sumMs = maxMs = sumCopyMs = 0.0;
+                windowStart = now;
+            }
+        }
+    }
+
+    // HELLO_XR_VIDEO360 wins over HELLO_XR_PHOTO360 when both are set.
+    void InitSkybox() {
+        const char* videoPath = getenv("HELLO_XR_VIDEO360");
+        if (videoPath != nullptr && videoPath[0] != '\0') {
+            if (OpenVideoTexture(videoPath)) return;
+            Log::Write(Log::Level::Warning, "video360: falling back to the still photo skybox");
+        }
+        LoadPhotoTexture();
+    }
+
     void InitializeResources() {
 #ifdef USE_ONLINE_VULKAN_SHADERC
         auto vertexSPIRV = CompileGlslShader("vertex", shaderc_glsl_default_vertex_shader, VertexShaderGlsl);
@@ -709,6 +1349,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (!m_cmdBuffer.Init(m_namer, m_vkDevice, m_queueFamilyIndex)) THROW("Failed to create command buffer");
 
         m_pipelineLayout.Create(m_vkDevice);
+
+        InitSkybox();
 
         // hello_xr: doesn't need compute shader support
 #if 0
@@ -821,8 +1463,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     }
 
     void RenderView(const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
-                    int64_t /*swapchainFormat*/, const std::vector<Cube>& cubes) override {
+                    int64_t /*swapchainFormat*/, const std::vector<Cube>& /*cubes*/) override {
         CHECK(layerView.subImage.imageArrayIndex == 0);  // Texture arrays not supported.
+
+        // RenderView runs once per eye. Upload on the first eye only: both eyes sample the same
+        // mono panorama, and swapping the texture between them would show each eye a different
+        // instant in time. This also halves the per-frame upload and mip-generation cost.
+        if (m_videoMode && (m_renderViewCalls++ % 2) == 0) {
+            UpdateVideoTexture();
+        }
 
         VulkanSwapchainImageData* swapchainData;
         uint32_t imageIndex;
@@ -876,36 +1525,72 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         VkClearRect clearRect{renderArea, 0, 1};
         vkCmdClearAttachments(m_cmdBuffer.buf, 2, &clearAttachments[0], 1, &clearRect);
 
-        // Bind index and vertex buffers
-        vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
+        // The photo is a skybox at infinity, so only the eye's ORIENTATION matters - translating
+        // your head must not shift an infinitely distant environment. Deliberately ignoring
+        // pose.position also keeps positional tracking jitter (the noisiest part of SLAM) out of
+        // the image entirely.
+        //
+        // The view ray is built straight from the FoV tangents rather than by inverting the
+        // view-projection matrix: a float32 cofactor inverse of a projection matrix (near 0.05,
+        // far 100) loses a lot of precision, and amplifies small pose changes into large errors.
+        XrPosef pose = layerView.pose;
+        if (getenv("HELLO_XR_FIXED_POSE")) {
+            pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+        }
 
+        // Tracking-stability instrumentation (HELLO_XR_POSE_STATS=1): reports the achieved frame
+        // rate and how far the reported orientation moves between frames. Held still, the
+        // inter-frame rotation is the tracker's jitter floor.
+        if (getenv("HELLO_XR_POSE_STATS")) {
+            static uint64_t calls = 0;
+            static std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+            static XrQuaternionf prev{0.0f, 0.0f, 0.0f, 1.0f};
+            static bool havePrev = false;
+            static double sumDeg = 0.0, maxDeg = 0.0;
+            static uint64_t samples = 0;
+
+            // RenderView runs once per eye and the G2's displays are canted, so only sample one eye.
+            if ((calls++ % 2) == 0) {
+                const XrQuaternionf& q = layerView.pose.orientation;
+                if (havePrev) {
+                    double dot = std::fabs((double)(q.x * prev.x + q.y * prev.y + q.z * prev.z + q.w * prev.w));
+                    double deg = 2.0 * std::acos(dot < 1.0 ? dot : 1.0) * 180.0 / 3.14159265358979323846;
+                    sumDeg += deg;
+                    if (deg > maxDeg) maxDeg = deg;
+                    samples++;
+                }
+                prev = q;
+                havePrev = true;
+
+                if (samples >= 120) {
+                    auto now = std::chrono::steady_clock::now();
+                    double secs = std::chrono::duration<double>(now - windowStart).count();
+                    Log::Write(Log::Level::Info, Fmt("pose stats: %.1f fps | inter-frame rotation mean %.4f deg max %.4f deg",
+                                                     samples / secs, sumDeg / samples, maxDeg));
+                    windowStart = now;
+                    sumDeg = maxDeg = 0.0;
+                    samples = 0;
+                }
+            }
+        }
+
+        // The pipeline's vertex input state still declares binding 0 (even though our vertex
+        // shader has no attributes to consume it) - bind something so the draw call is valid.
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(m_cmdBuffer.buf, 0, 1, &m_drawBuffer.vtx.buf, &offset);
 
-        // Compute the view-projection transform.
-        // Note all matrixes (including OpenXR's) are column-major, right-handed.
-        const auto& pose = layerView.pose;
-        XrMatrix4x4f proj;
-        XrMatrix4x4f_CreateProjectionFov(&proj, GRAPHICS_VULKAN, layerView.fov, 0.05f, 100.0f);
-        XrMatrix4x4f toView;
-        XrMatrix4x4f_CreateFromRigidTransform(&toView, &pose);
-        XrMatrix4x4f view;
-        XrMatrix4x4f_InvertRigidBody(&view, &toView);
-        XrMatrix4x4f vp;
-        XrMatrix4x4f_Multiply(&vp, &proj, &view);
+        VulkanUniformBuffer pushConstants{};
+        XrMatrix4x4f_CreateFromQuaternion(&pushConstants.mvp, &pose.orientation);
+        pushConstants.tintColor = {tanf(layerView.fov.angleLeft), tanf(layerView.fov.angleRight),
+                                   tanf(layerView.fov.angleUp), tanf(layerView.fov.angleDown)};
+        vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(pushConstants), &pushConstants);
 
-        // Render each cube
-        for (const Cube& cube : cubes) {
-            // Compute the model-view-projection transform and push it.
-            XrMatrix4x4f model;
-            XrMatrix4x4f_CreateTranslationRotationScale(&model, &cube.Pose.position, &cube.Pose.orientation, &cube.Scale);
-            XrMatrix4x4f mvp;
-            XrMatrix4x4f_Multiply(&mvp, &vp, &model);
-            vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+        vkCmdBindDescriptorSets(m_cmdBuffer.buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout.layout, 0, 1,
+                                &m_photoDescriptorSet, 0, nullptr);
 
-            // Draw the cube.
-            vkCmdDrawIndexed(m_cmdBuffer.buf, m_drawBuffer.count.idx, 1, 0, 0, 0);
-        }
+        // Fullscreen triangle, no vertex/index buffer needed.
+        vkCmdDraw(m_cmdBuffer.buf, 3, 1, 0, 0);
 
         vkCmdEndRenderPass(m_cmdBuffer.buf);
 
@@ -951,6 +1636,48 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     PipelineLayout m_computePipelineLayout{};
     VkDescriptorSet m_ComputeDescriptorSet;
+
+    // Equirect photo texture, sampled as a skybox.
+    // 360 skybox texture, shared by the photo and video paths.
+    int m_texWidth{0};
+    int m_texHeight{0};
+    uint32_t m_texMipLevels{1};
+
+    Video360 m_video;
+    bool m_videoMode{false};
+    VkBuffer m_videoStaging{VK_NULL_HANDLE};
+    VkDeviceMemory m_videoStagingMemory{VK_NULL_HANDLE};
+    void* m_videoStagingMapped{nullptr};
+    VkDeviceSize m_videoUVOffset{0};
+
+    // NV12 plane textures the decoder output is uploaded into each frame.
+    VkImage m_videoYImage{VK_NULL_HANDLE};
+    VkDeviceMemory m_videoYMemory{VK_NULL_HANDLE};
+    VkImageView m_videoYView{VK_NULL_HANDLE};
+    VkImage m_videoUVImage{VK_NULL_HANDLE};
+    VkDeviceMemory m_videoUVMemory{VK_NULL_HANDLE};
+    VkImageView m_videoUVView{VK_NULL_HANDLE};
+    VkSampler m_videoYuvSampler{VK_NULL_HANDLE};
+
+    // GPU YUV->RGB conversion pass (renders into a UNORM view of m_photoImage level 0).
+    VkImageView m_videoRgbTargetView{VK_NULL_HANDLE};
+    VkRenderPass m_videoConvertPass{VK_NULL_HANDLE};
+    VkFramebuffer m_videoConvertFb{VK_NULL_HANDLE};
+    VkDescriptorSetLayout m_videoConvertSetLayout{VK_NULL_HANDLE};
+    VkPipelineLayout m_videoConvertPipeLayout{VK_NULL_HANDLE};
+    VkDescriptorPool m_videoConvertDescPool{VK_NULL_HANDLE};
+    VkDescriptorSet m_videoConvertDescSet{VK_NULL_HANDLE};
+    VkPipeline m_videoConvertPipeline{VK_NULL_HANDLE};
+    VkShaderModule m_videoVertModule{VK_NULL_HANDLE};
+    VkShaderModule m_videoFragModule{VK_NULL_HANDLE};
+    uint64_t m_renderViewCalls{0};
+
+    VkImage m_photoImage{VK_NULL_HANDLE};
+    VkDeviceMemory m_photoImageMemory{VK_NULL_HANDLE};
+    VkImageView m_photoImageView{VK_NULL_HANDLE};
+    VkSampler m_photoSampler{VK_NULL_HANDLE};
+    VkDescriptorPool m_photoDescriptorPool{VK_NULL_HANDLE};
+    VkDescriptorSet m_photoDescriptorSet{VK_NULL_HANDLE};
 
 #if defined(USE_MIRROR_WINDOW)
     Swapchain m_swapchain{};

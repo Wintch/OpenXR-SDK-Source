@@ -30,6 +30,7 @@ set(LOCAL_HEADERS
     platformdata.h
     platformplugin.h
     swapchain_image_data.h
+    video360.h
     vulkan_utils.h
 )
 set(LOCAL_SOURCE
@@ -51,6 +52,7 @@ set(LOCAL_SOURCE
     platformplugin_posix.cpp
     platformplugin_win32.cpp
     swapchain_image_data.cpp
+    video360.cpp
 )
 set(VULKAN_SHADERS vulkan_shaders/frag.glsl vulkan_shaders/vert.glsl)
 
@@ -112,6 +114,30 @@ compile_glsl(run_hello_xr_glsl_compiles ${VULKAN_SHADERS})
 
 add_dependencies(hello_xr run_hello_xr_glsl_compiles)
 
+# The NV12->RGB conversion shader for the 360 video path. compile_glsl derives the shader
+# stage from the file name (frag.glsl -> frag), which allows only one file per stage, so this
+# extra fragment shader gets its own explicit rule.
+set(YUV_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/yuv_frag.spv")
+if(GLSL_COMPILER)
+    add_custom_command(
+        OUTPUT "${YUV_FRAG_SPV}"
+        COMMAND "${GLSL_COMPILER}" -mfmt=c -fshader-stage=frag "vulkan_shaders/yuv_frag.glsl" -o "${YUV_FRAG_SPV}"
+        DEPENDS "vulkan_shaders/yuv_frag.glsl"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        VERBATIM
+    )
+elseif(GLSLANG_VALIDATOR)
+    add_custom_command(
+        OUTPUT "${YUV_FRAG_SPV}"
+        COMMAND "${GLSLANG_VALIDATOR}" -V -S frag "vulkan_shaders/yuv_frag.glsl" -x -o "${YUV_FRAG_SPV}"
+        DEPENDS "vulkan_shaders/yuv_frag.glsl"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        VERBATIM
+    )
+endif()
+add_custom_target(run_hello_xr_yuv_glsl ALL DEPENDS "${YUV_FRAG_SPV}")
+add_dependencies(hello_xr run_hello_xr_yuv_glsl)
+
 target_include_directories(
     hello_xr
     PRIVATE
@@ -133,6 +159,21 @@ endif()
 if(XR_USE_GRAPHICS_API_VULKAN)
     target_include_directories(hello_xr PRIVATE ${Vulkan_INCLUDE_DIRS})
     target_link_libraries(hello_xr PRIVATE ${Vulkan_LIBRARY})
+endif()
+
+# 360 equirectangular video playback (video360.cpp). Optional - without ffmpeg the viewer
+# still shows still photos, it just refuses HELLO_XR_VIDEO360.
+find_package(PkgConfig QUIET)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(
+        FFMPEG IMPORTED_TARGET libavcodec libavformat libavutil libswscale
+    )
+endif()
+if(FFMPEG_FOUND)
+    target_link_libraries(hello_xr PRIVATE PkgConfig::FFMPEG)
+    target_compile_definitions(hello_xr PRIVATE HAVE_FFMPEG)
+else()
+    message(STATUS "hello_xr: ffmpeg not found - 360 video playback disabled")
 endif()
 
 if(TARGET openxr-gfxwrapper)

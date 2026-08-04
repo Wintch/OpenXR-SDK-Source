@@ -7,15 +7,7 @@
 
 #pragma vertex
 
-layout (std140, push_constant) uniform buf
-{
-    mat4 mvp;
-} ubuf;
-
-layout (location = 0) in vec3 Position;
-layout (location = 1) in vec3 Color;
-
-layout (location = 0) out vec4 oColor;
+layout (location = 0) out vec2 oNdc;
 out gl_PerVertex
 {
     vec4 gl_Position;
@@ -23,7 +15,7 @@ out gl_PerVertex
 
 void main()
 {
-    oColor.rgb  = Color.rgb;
-    oColor.a  = 1.0;
-    gl_Position = ubuf.mvp * vec4(Position, 1);
+    vec2 pos[3] = vec2[](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+    oNdc = pos[gl_VertexIndex];
+    gl_Position = vec4(oNdc, 0.0, 1.0);
 }
