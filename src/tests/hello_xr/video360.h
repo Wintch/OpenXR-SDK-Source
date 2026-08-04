@@ -1,13 +1,22 @@
 // 360 equirectangular video source for the hello_xr photo/video skybox.
 //
-// Decodes a video file on a background thread into a small ring of NV12 frames and hands
-// the render loop whichever frame is due according to a wall clock. Playback loops forever.
+// Decodes a video file on a background thread and hands the render loop whichever frame is
+// due according to a wall clock. Playback loops forever.
 //
 // Decode is NVDEC (ffmpeg CUDA hwaccel) when available, with automatic fallback to software
 // decode (HELLO_XR_VIDEO_HW=0 forces the fallback). Either way the output is normalized to
 // 8-bit NV12 (tightly packed Y plane + interleaved half-res CbCr plane) and the YUV->RGB
 // conversion happens on the GPU in a fragment shader - there is no libswscale in the loop,
 // which was measured to cost more CPU than the decode itself at 4K.
+//
+// The decoder does NOT own its output frames: the caller hands it a set of buffers via
+// SetFrameBuffers() and the decode thread writes NV12 straight into them. The point is that
+// the graphics backend can pass mapped Vulkan staging memory, so a decoded frame is already
+// where the GPU wants it and the render thread never copies anything. At 8K that memcpy was
+// measured at 8.9 ms per frame on the render thread - more than half a 60Hz frame budget.
+//
+// Hence the three-step startup: Open() (learn the geometry) -> SetFrameBuffers() (the caller
+// can now size its allocations) -> Start() (begin decoding).
 
 #pragma once
 
@@ -15,24 +24,42 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
-// One decoded frame, normalized to tightly-packed 8-bit NV12.
-// y is Width()*Height() bytes; uv is interleaved CbCr, (Width()/2)*(Height()/2)*2 bytes.
-struct Video360Frame {
-    const uint8_t* y{nullptr};
-    const uint8_t* uv{nullptr};
+#include "projection360.h"
+
+// Where one decoded frame goes. Memory is owned by the caller and must stay valid and mapped
+// for the lifetime of the Video360. y is Width()*Height() bytes; uv is interleaved CbCr,
+// Width()*Height()/2 bytes. Both are written sequentially, never read - safe for the
+// write-combined host memory Vulkan hands out.
+struct Video360Buffer {
+    uint8_t* y{nullptr};
+    uint8_t* uv{nullptr};
 };
 
 class Video360 {
    public:
+    // How many frame buffers the caller should provide. Three deep is enough to absorb
+    // decode-time spikes (keyframes cost far more than P-frames) without adding real latency,
+    // plus one held by the renderer and one being written = five.
+    static constexpr size_t kFrameBuffers = 5;
+
     Video360();
     ~Video360();
 
     Video360(const Video360&) = delete;
     Video360& operator=(const Video360&) = delete;
 
-    // Opens the file and starts the decode thread. Returns false (and logs) on failure.
+    // Opens the file and reads the stream geometry. Does not decode anything yet, so the
+    // caller can size its buffers from Width()/Height(). Returns false (and logs) on failure.
     bool Open(const std::string& path);
+
+    // Hands over the destination buffers. Must be called after Open() and before Start(),
+    // with at least two buffers (kFrameBuffers is the sane number).
+    void SetFrameBuffers(std::vector<Video360Buffer> buffers);
+
+    // Starts the decode thread. Returns false if no buffers were set.
+    bool Start();
 
     bool IsOpen() const;
     int Width() const;
@@ -41,18 +68,29 @@ class Video360 {
     size_t YBytes() const;   // Width() * Height()
     size_t UVBytes() const;  // Width() * Height() / 2
 
-    // Colorimetry of the stream, for the GPU conversion shader. Stable after Open() using
-    // stream metadata; unspecified streams fall back to the HD/SD heuristic (>=720p -> BT.709).
+    // Frames per second the file declares. Useful to sanity-check what the pipeline sustains.
+    double FrameRate() const;
+
+    // Name of the video codec, for the "now playing" banner.
+    std::string CodecName() const;
+
+    // What the container says about projection and stereo packing (the MP4 `sv3d`/`st3d`
+    // boxes). Either field may come back Unknown; feed the result to ResolvePanoLayout().
+    PanoLayout DetectedLayout() const;
+
+    // Colorimetry of the stream, for the GPU conversion shader. Stable after the first frame
+    // using stream metadata; unspecified streams fall back to the HD/SD heuristic (>=720p ->
+    // BT.709).
     bool FullRange() const;
     bool Bt709() const;
 
     // True when NVDEC is actually decoding (not merely requested).
     bool HwDecodeActive() const;
 
-    // Returns the frame that should be on screen now, or nullptr when the frame already
-    // uploaded is still the correct one (i.e. nothing new is due yet). The returned pointer
-    // stays valid until the next call.
-    const Video360Frame* AcquireCurrentFrame();
+    // Index of the buffer that should be on screen now, or -1 when the frame already uploaded
+    // is still the correct one (i.e. nothing new is due yet). The returned buffer stays valid
+    // and untouched by the decoder until the next call that returns a different index.
+    int AcquireCurrentSlot();
 
    private:
     struct Impl;

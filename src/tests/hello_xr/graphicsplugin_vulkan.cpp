@@ -839,7 +839,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         int width, height, channels;
         stbi_uc* pixels = stbi_load(photoPath.c_str(), &width, &height, &channels, STBI_rgb_alpha);
         if (!pixels) THROW(Fmt("Failed to load 360 photo '%s': %s", photoPath.c_str(), stbi_failure_reason()));
-        Log::Write(Log::Level::Info, Fmt("Loaded 360 photo '%s' (%dx%d)", photoPath.c_str(), width, height));
+
+        m_panoLayout = ResolvePanoLayout(PanoLayout{}, photoPath, width, height);
+        AnnounceSkybox(photoPath, width, height, 0.0, "");
 
         VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
 
@@ -1128,6 +1130,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     bool OpenVideoTexture(const std::string& path) {
         if (!m_video.Open(path)) return false;
 
+        m_panoLayout = ResolvePanoLayout(m_video.DetectedLayout(), path, m_video.Width(), m_video.Height());
+        AnnounceSkybox(path, m_video.Width(), m_video.Height(), m_video.FrameRate(), m_video.CodecName());
+
         // Cap the mip chain: it is regenerated every frame, and a 4K pano in the eye buffer
         // rarely minifies past level ~5. The full 12-level chain was pure per-frame overhead.
         CreateSkyboxTexture(m_video.Width(), m_video.Height(), 6);
@@ -1137,20 +1142,42 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         CreateVideoPlaneImage((uint32_t)m_video.Width() / 2, (uint32_t)m_video.Height() / 2, VK_FORMAT_R8G8_UNORM,
                               &m_videoUVImage, &m_videoUVMemory, &m_videoUVView);
 
-        // One staging buffer for the whole run, mapped once and never unmapped. NV12 is
-        // 1.5 bytes/pixel - ~12MB at 4K vs the 32MB the old RGBA path pushed per frame.
+        // A ring of staging buffers, each mapped once and never unmapped, handed to the decoder
+        // as its frame ring: it writes NV12 straight in here, so the render thread's only job
+        // is to point a vkCmdCopyBufferToImage at whichever one is due. NV12 is 1.5 bytes per
+        // pixel, so ~12MB per buffer at 4K and ~47MB at 8K.
+        //
+        // This replaced a single buffer plus a per-frame memcpy from decoder-owned memory,
+        // which cost 8.9 ms of render-thread time per 8K frame - over half a 60Hz budget.
         m_videoUVOffset = (VkDeviceSize)((m_video.YBytes() + 255) & ~size_t(255));
-        VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        bufInfo.size = m_videoUVOffset + (VkDeviceSize)m_video.UVBytes();
-        bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        XRC_CHECK_THROW_VKCMD(vkCreateBuffer(m_vkDevice, &bufInfo, nullptr, &m_videoStaging));
+        const VkDeviceSize stagingSize = m_videoUVOffset + (VkDeviceSize)m_video.UVBytes();
 
-        VkMemoryRequirements memReq{};
-        vkGetBufferMemoryRequirements(m_vkDevice, m_videoStaging, &memReq);
-        m_memAllocator.Allocate(memReq, &m_videoStagingMemory);
-        XRC_CHECK_THROW_VKCMD(vkBindBufferMemory(m_vkDevice, m_videoStaging, m_videoStagingMemory, 0));
-        XRC_CHECK_THROW_VKCMD(vkMapMemory(m_vkDevice, m_videoStagingMemory, 0, bufInfo.size, 0, &m_videoStagingMapped));
+        std::vector<Video360Buffer> frameBuffers;
+        for (size_t i = 0; i < Video360::kFrameBuffers; i++) {
+            VkBufferCreateInfo bufInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bufInfo.size = stagingSize;
+            bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VkBuffer buf{VK_NULL_HANDLE};
+            XRC_CHECK_THROW_VKCMD(vkCreateBuffer(m_vkDevice, &bufInfo, nullptr, &buf));
+
+            VkMemoryRequirements memReq{};
+            vkGetBufferMemoryRequirements(m_vkDevice, buf, &memReq);
+            VkDeviceMemory mem{VK_NULL_HANDLE};
+            m_memAllocator.Allocate(memReq, &mem);
+            XRC_CHECK_THROW_VKCMD(vkBindBufferMemory(m_vkDevice, buf, mem, 0));
+            void* mapped = nullptr;
+            XRC_CHECK_THROW_VKCMD(vkMapMemory(m_vkDevice, mem, 0, stagingSize, 0, &mapped));
+
+            m_videoStaging.push_back(buf);
+            m_videoStagingMemory.push_back(mem);
+            frameBuffers.push_back(Video360Buffer{(uint8_t*)mapped, (uint8_t*)mapped + m_videoUVOffset});
+        }
+        Log::Write(Log::Level::Info, Fmt("video360: %zu staging buffers of %.1f MB (%.0f MB total, host-visible)",
+                                         (size_t)Video360::kFrameBuffers, stagingSize / (1024.0 * 1024.0),
+                                         Video360::kFrameBuffers * stagingSize / (1024.0 * 1024.0)));
+
+        m_video.SetFrameBuffers(std::move(frameBuffers));
 
         CreateVideoConvertResources();
 
@@ -1185,6 +1212,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_cmdBuffer.Wait();
         m_cmdBuffer.Clear();
 
+        // Everything the decoder writes into now exists, so let it run.
+        if (!m_video.Start()) return false;
+
         m_videoMode = true;
         return true;
     }
@@ -1193,15 +1223,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     // into the skybox texture, and regenerates its mip chain. Cheap to call when nothing is
     // due - the decoder returns null and this becomes a no-op.
     void UpdateVideoTexture() {
-        const Video360Frame* frame = m_video.AcquireCurrentFrame();
-        if (frame == nullptr) return;
+        const int slot = m_video.AcquireCurrentSlot();
+        if (slot < 0) return;
+        const VkBuffer staging = m_videoStaging[slot];
 
         const bool stats = getenv("HELLO_XR_VIDEO_STATS") != nullptr;
         const auto uploadStart = std::chrono::steady_clock::now();
-
-        memcpy(m_videoStagingMapped, frame->y, m_video.YBytes());
-        memcpy((uint8_t*)m_videoStagingMapped + m_videoUVOffset, frame->uv, m_video.UVBytes());
-        const auto copyDone = std::chrono::steady_clock::now();
 
         m_cmdBuffer.Clear();
         m_cmdBuffer.Begin();
@@ -1227,14 +1254,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         yRegion.bufferOffset = 0;
         yRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         yRegion.imageExtent = {(uint32_t)m_texWidth, (uint32_t)m_texHeight, 1};
-        vkCmdCopyBufferToImage(m_cmdBuffer.buf, m_videoStaging, m_videoYImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &yRegion);
+        vkCmdCopyBufferToImage(m_cmdBuffer.buf, staging, m_videoYImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &yRegion);
 
         VkBufferImageCopy uvRegion{};
         uvRegion.bufferOffset = m_videoUVOffset;
         uvRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         uvRegion.imageExtent = {(uint32_t)m_texWidth / 2, (uint32_t)m_texHeight / 2, 1};
-        vkCmdCopyBufferToImage(m_cmdBuffer.buf, m_videoStaging, m_videoUVImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                               &uvRegion);
+        vkCmdCopyBufferToImage(m_cmdBuffer.buf, staging, m_videoUVImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &uvRegion);
 
         VkImageMemoryBarrier planeToRead[2];
         for (int i = 0; i < 2; i++) {
@@ -1285,31 +1311,47 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_cmdBuffer.Wait();
         m_cmdBuffer.Clear();
 
-        // HELLO_XR_VIDEO_STATS=1: how many frames actually reached the screen, and what the
-        // staging copy + mip chain cost. If the upload rate sits below the file's frame rate,
-        // the decoder is not keeping up and playback is dropping frames.
+        // HELLO_XR_VIDEO_STATS=1: how many frames actually reached the screen and what they
+        // cost the render thread. This is now pure GPU time (record + submit + wait for the
+        // copy, conversion and mip chain) - there is no CPU copy left on this side. Compare it
+        // against the "video decode:" line the decoder logs: if uploads/s sits below the file's
+        // frame rate while the decoder keeps up, the render loop is the bottleneck.
         if (stats) {
             static uint64_t uploads = 0;
-            static double sumMs = 0.0, maxMs = 0.0, sumCopyMs = 0.0;
+            static double sumMs = 0.0, maxMs = 0.0;
             static auto windowStart = std::chrono::steady_clock::now();
 
             const auto now = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(now - uploadStart).count();
-            sumCopyMs += std::chrono::duration<double, std::milli>(copyDone - uploadStart).count();
             sumMs += ms;
             if (ms > maxMs) maxMs = ms;
 
             if (++uploads >= 60) {
                 const double secs = std::chrono::duration<double>(now - windowStart).count();
-                Log::Write(Log::Level::Info,
-                           Fmt("video stats: %.1f frames/s uploaded | total mean %.2f ms max %.2f ms "
-                               "(staging memcpy %.2f ms, gpu copy+mips %.2f ms)",
-                               uploads / secs, sumMs / uploads, maxMs, sumCopyMs / uploads, (sumMs - sumCopyMs) / uploads));
+                Log::Write(Log::Level::Info, Fmt("video upload: %.1f frames/s to the skybox (file is %.1f) | "
+                                                 "render thread %.2f ms mean, %.2f ms max - gpu copy+convert+mips",
+                                                 uploads / secs, m_video.FrameRate(), sumMs / uploads, maxMs));
                 uploads = 0;
-                sumMs = maxMs = sumCopyMs = 0.0;
+                sumMs = maxMs = 0.0;
                 windowStart = now;
             }
         }
+    }
+
+    // Says out loud what is about to be shown. Once the headset is on there is no other way to
+    // tell a VR180 file being rendered as a 360 one (which looks plausible, just wrong) from a
+    // correct reading - so the mode, the resolution and the frame rate go on the terminal
+    // before anything is drawn.
+    void AnnounceSkybox(const std::string& path, int width, int height, double fps, const std::string& codec) {
+        const size_t slash = path.find_last_of('/');
+        Log::Write(Log::Level::Info,
+                   Fmt("\n"
+                       "  ============================================================\n"
+                       "%s\n"
+                       "  %s\n"
+                       "  ============================================================",
+                       PanoBanner(m_panoLayout, width, height, fps, codec).c_str(),
+                       (slash == std::string::npos ? path : path.substr(slash + 1)).c_str()));
     }
 
     // HELLO_XR_VIDEO360 wins over HELLO_XR_PHOTO360 when both are set.
@@ -1466,10 +1508,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     int64_t /*swapchainFormat*/, const std::vector<Cube>& /*cubes*/) override {
         CHECK(layerView.subImage.imageArrayIndex == 0);  // Texture arrays not supported.
 
-        // RenderView runs once per eye. Upload on the first eye only: both eyes sample the same
-        // mono panorama, and swapping the texture between them would show each eye a different
-        // instant in time. This also halves the per-frame upload and mip-generation cost.
-        if (m_videoMode && (m_renderViewCalls++ % 2) == 0) {
+        // RenderView runs once per eye, left then right, so the call parity IS the eye index.
+        // (The plugin interface does not carry one, and both eyes come from a single packed
+        // frame anyway - the stereo split happens in the shader, not here.)
+        const int eye = (int)(m_renderViewCalls++ % 2);
+
+        // Upload on the left eye only: the two eyes are two halves of the SAME decoded frame,
+        // so swapping the texture between them would show each eye a different instant in
+        // time. This also halves the per-frame upload and mip-generation cost.
+        if (m_videoMode && eye == 0) {
             UpdateVideoTexture();
         }
 
@@ -1583,6 +1630,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         XrMatrix4x4f_CreateFromQuaternion(&pushConstants.mvp, &pose.orientation);
         pushConstants.tintColor = {tanf(layerView.fov.angleLeft), tanf(layerView.fov.angleRight),
                                    tanf(layerView.fov.angleUp), tanf(layerView.fov.angleDown)};
+        PanoEyeUvTransform(m_panoLayout, eye, &pushConstants.uvScaleOffset[0], &pushConstants.uvScaleOffset[2]);
+        pushConstants.panoFov[0] = m_panoLayout.halfFovX;
+        pushConstants.panoFov[1] = m_panoLayout.halfFovY;
+        pushConstants.mode[0] = (m_panoLayout.projection == PanoProjection::HalfEquirect180)   ? 1
+                                : (m_panoLayout.projection == PanoProjection::Flat)           ? 2
+                                                                                              : 0;
         vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(pushConstants), &pushConstants);
 
@@ -1638,6 +1691,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkDescriptorSet m_ComputeDescriptorSet;
 
     // Equirect photo texture, sampled as a skybox.
+    // How the loaded image maps onto the sphere (360 / VR180 / flat) and how the two eyes are
+    // packed into it. Resolved once at load time and fed to the skybox shader every frame.
+    PanoLayout m_panoLayout;
+
     // 360 skybox texture, shared by the photo and video paths.
     int m_texWidth{0};
     int m_texHeight{0};
@@ -1645,9 +1702,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     Video360 m_video;
     bool m_videoMode{false};
-    VkBuffer m_videoStaging{VK_NULL_HANDLE};
-    VkDeviceMemory m_videoStagingMemory{VK_NULL_HANDLE};
-    void* m_videoStagingMapped{nullptr};
+    // One staging buffer per decoder frame slot; index with what AcquireCurrentSlot() returns.
+    std::vector<VkBuffer> m_videoStaging;
+    std::vector<VkDeviceMemory> m_videoStagingMemory;
     VkDeviceSize m_videoUVOffset{0};
 
     // NV12 plane textures the decoder output is uploaded into each frame.
