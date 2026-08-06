@@ -7,6 +7,7 @@
 //   space   pause / resume
 //   [  ]    slower / faster (1x, 0.5x, 0.25x, 2x ...)
 //   1       back to normal speed
+//   h  l    seek -10s / +10s
 //   n       next file in the playlist
 //   q ESC   quit
 
@@ -26,6 +27,19 @@ bool IsPaused();
 
 // Set by 'n', cleared by whoever acts on it. Ignored when there is only one file.
 bool TakeNextTrackRequest();
+
+// Seconds to jump the playback position by (negative = back), accumulated from 'h'/'l' and
+// controller thumbstick pushes since the last call. Cleared on read. 0 most of the time.
+int TakeSeekRequest();
+
+// Queues a seek jump in seconds (positive = forward). Called by HandleKey and by the
+// controller thumbstick poll in openxr_program.cpp.
+void QueueSeek(int seconds);
+
+// How long ago (seconds) the user last touched a transport control (pause/seek/speed) -
+// drives the progress bar's auto-hide timer. A large number once nothing has happened for a
+// while.
+double SecondsSinceLastInteraction();
 
 // True once a quit key has been pressed.
 bool QuitRequested();

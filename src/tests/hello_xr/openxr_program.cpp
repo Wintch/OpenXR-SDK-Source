@@ -10,6 +10,7 @@
 #include "graphicsplugin.h"
 #include "swapchain_image_data.h"
 #include "openxr_program.h"
+#include "playercontrol.h"
 #include <common/xr_linear.h>
 #include <array>
 #include <cmath>
@@ -377,6 +378,11 @@ struct OpenXrProgram : IOpenXrProgram {
         XrAction poseAction{XR_NULL_HANDLE};
         XrAction vibrateAction{XR_NULL_HANDLE};
         XrAction quitAction{XR_NULL_HANDLE};
+        // Thumbstick X axis, WMR motion controller only (see the binding block below) - used
+        // to seek the 360/VR180 video player. Not bound on other profiles: we only have a WMR
+        // controller to test with, and guessing paths for profiles we cannot verify is how
+        // silently-wrong bindings happen.
+        XrAction seekAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
         std::array<float, Side::COUNT> handScale = {{1.0f, 1.0f}};
@@ -433,6 +439,14 @@ struct OpenXrProgram : IOpenXrProgram {
             actionInfo.countSubactionPaths = 0;
             actionInfo.subactionPaths = nullptr;
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.quitAction));
+
+            // Thumbstick X for video seek (WMR only, see InputState::seekAction).
+            actionInfo.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+            strcpy_s(actionInfo.actionName, "seek_video");
+            strcpy_s(actionInfo.localizedActionName, "Seek Video");
+            actionInfo.countSubactionPaths = uint32_t(m_input.handSubactionPath.size());
+            actionInfo.subactionPaths = m_input.handSubactionPath.data();
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.seekAction));
         }
 
         std::array<XrPath, Side::COUNT> selectPath;
@@ -444,6 +458,7 @@ struct OpenXrProgram : IOpenXrProgram {
         std::array<XrPath, Side::COUNT> menuClickPath;
         std::array<XrPath, Side::COUNT> bClickPath;
         std::array<XrPath, Side::COUNT> triggerValuePath;
+        std::array<XrPath, Side::COUNT> thumbstickXPath;
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/select/click", &selectPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/select/click", &selectPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/squeeze/value", &squeezeValuePath[Side::LEFT]));
@@ -462,6 +477,8 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/b/click", &bClickPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/trigger/value", &triggerValuePath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/trigger/value", &triggerValuePath[Side::RIGHT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick/x", &thumbstickXPath[Side::LEFT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/thumbstick/x", &thumbstickXPath[Side::RIGHT]));
         // Suggest bindings for KHR Simple.
         {
             XrPath khrSimpleInteractionProfilePath;
@@ -552,7 +569,9 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.quitAction, menuClickPath[Side::LEFT]},
                                                             {m_input.quitAction, menuClickPath[Side::RIGHT]},
                                                             {m_input.vibrateAction, hapticPath[Side::LEFT]},
-                                                            {m_input.vibrateAction, hapticPath[Side::RIGHT]}}};
+                                                            {m_input.vibrateAction, hapticPath[Side::RIGHT]},
+                                                            {m_input.seekAction, thumbstickXPath[Side::LEFT]},
+                                                            {m_input.seekAction, thumbstickXPath[Side::RIGHT]}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = microsoftMixedRealityInteractionProfilePath;
             suggestedBindings.suggestedBindings = bindings.data();
@@ -935,6 +954,24 @@ struct OpenXrProgram : IOpenXrProgram {
             XrActionStatePose poseState{XR_TYPE_ACTION_STATE_POSE};
             CHECK_XRCMD(xrGetActionStatePose(m_session, &getInfo, &poseState));
             m_input.handActive[hand] = poseState.isActive;
+
+            // Video seek: thumbstick push left/right jumps -10s/+10s. Hysteresis latch, not a
+            // raw per-frame trigger - a stick held past the threshold would otherwise queue a
+            // jump on every single frame it stays pushed. Push past 0.7 to fire once, must come
+            // back under 0.3 before it can fire again.
+            static std::array<bool, Side::COUNT> seekLatched{{false, false}};
+            getInfo.action = m_input.seekAction;
+            XrActionStateFloat seekValue{XR_TYPE_ACTION_STATE_FLOAT};
+            CHECK_XRCMD(xrGetActionStateFloat(m_session, &getInfo, &seekValue));
+            if (seekValue.isActive == XR_TRUE) {
+                const float v = seekValue.currentState;
+                if (!seekLatched[hand] && std::fabs(v) > 0.7f) {
+                    PlayerControl::QueueSeek(v > 0.0f ? 10 : -10);
+                    seekLatched[hand] = true;
+                } else if (seekLatched[hand] && std::fabs(v) < 0.3f) {
+                    seekLatched[hand] = false;
+                }
+            }
         }
 
         // There were no subaction paths specified for the quit action, because we don't care which hand did it.

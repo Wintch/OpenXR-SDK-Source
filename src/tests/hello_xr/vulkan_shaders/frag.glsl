@@ -84,4 +84,16 @@ void main()
     dy *= ubuf.uvScaleOffset.xy;
 
     FragColor = vec4(textureGrad(equirectTex, uv, dx, dy).rgb * inside, 1.0);
+
+    // Progress bar: a thin strip near the bottom of the screen, drawn straight in screen
+    // space (not projected onto the pano), so it stays flat and legible no matter what
+    // projection mode is active or what direction you're looking. mode.y/mode.z aren't used
+    // by anything above - reusing them here instead of growing the push-constant struct past
+    // the 128 bytes Vulkan guarantees (it's already exactly at that limit).
+    float barAlpha = float(ubuf.mode.z) / 255.0;
+    if (barAlpha > 0.0 && t > 0.94 && t < 0.98) {
+        float progress = float(ubuf.mode.y) / 1000.0;
+        vec3 barColor = (s < progress) ? vec3(1.0, 1.0, 1.0) : vec3(0.35, 0.35, 0.35);
+        FragColor.rgb = mix(FragColor.rgb, barColor, barAlpha);
+    }
 }

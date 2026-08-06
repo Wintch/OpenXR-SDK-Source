@@ -25,6 +25,9 @@ int Video360::Height() const { return 0; }
 size_t Video360::YBytes() const { return 0; }
 size_t Video360::UVBytes() const { return 0; }
 double Video360::FrameRate() const { return 0.0; }
+double Video360::Duration() const { return 0.0; }
+double Video360::PlaybackPosition() const { return 0.0; }
+void Video360::Seek(double) {}
 std::string Video360::CodecName() const { return "none"; }
 PanoLayout Video360::DetectedLayout() const { return PanoLayout{}; }
 bool Video360::FullRange() const { return false; }
@@ -117,6 +120,12 @@ struct Video360::Impl {
     int height{0};
     double timeBase{0.0};
     double frameDuration{1.0 / 30.0};  // fallback when a frame carries no usable pts
+    double durationSeconds{0.0};       // 0 if the container did not say
+
+    // Seek request from Seek(), consumed at the top of DecodeLoop()'s while loop. Guarded by
+    // mutex, same as the other cross-thread state below.
+    bool seekPending{false};
+    int64_t seekTargetPts{0};  // stream timeBase units
     std::string codecName{"unknown"};
     PanoLayout layout;  // whatever the container declared; Unknown fields mean "it did not say"
 
@@ -347,6 +356,28 @@ struct Video360::Impl {
         double lastPts = 0.0;
 
         while (!quit) {
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                if (seekPending) {
+                    const int64_t targetPts = seekTargetPts;
+                    seekPending = false;
+                    lock.unlock();
+
+                    avcodec_flush_buffers(dec);
+                    if (av_seek_frame(fmt, streamIndex, targetPts, AVSEEK_FLAG_BACKWARD) < 0) {
+                        Log::Write(Log::Level::Warning, "video360: seek failed");
+                    } else {
+                        std::lock_guard<std::mutex> lock2(mutex);
+                        for (const auto& qf : queue) freeSlots.push_back(qf.slot);
+                        queue.clear();
+                        clockStarted = false;  // re-anchor playbackTime to the first post-seek frame
+                        loopOffset = 0.0;      // this is an absolute jump, not a loop-around
+                        spaceAvailable.notify_all();
+                    }
+                    continue;
+                }
+            }
+
             int ret = av_read_frame(fmt, packet);
 
             if (ret == AVERROR_EOF) {
@@ -531,6 +562,13 @@ bool Video360::Open(const std::string& path) {
     if (stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0) {
         impl.frameDuration = av_q2d(AVRational{stream->avg_frame_rate.den, stream->avg_frame_rate.num});
     }
+    // Prefer the container-level duration (AV_TIME_BASE units, i.e. microseconds) over the
+    // stream's own - some files only set one or the other.
+    if (impl.fmt->duration != AV_NOPTS_VALUE) {
+        impl.durationSeconds = (double)impl.fmt->duration / AV_TIME_BASE;
+    } else if (stream->duration != AV_NOPTS_VALUE) {
+        impl.durationSeconds = stream->duration * impl.timeBase;
+    }
     if (impl.width <= 0 || impl.height <= 0 || (impl.width % 2) != 0 || (impl.height % 2) != 0) {
         Log::Write(Log::Level::Error, Fmt("video360: %dx%d is not a usable even-sized frame", impl.width, impl.height));
         return false;
@@ -644,6 +682,22 @@ int Video360::Height() const { return m_impl->height; }
 size_t Video360::YBytes() const { return m_impl->YBytes(); }
 size_t Video360::UVBytes() const { return m_impl->UVBytes(); }
 double Video360::FrameRate() const { return m_impl->frameDuration > 0.0 ? 1.0 / m_impl->frameDuration : 0.0; }
+double Video360::Duration() const { return m_impl->durationSeconds; }
+double Video360::PlaybackPosition() const {
+    Impl& impl = *m_impl;
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    return impl.playbackTime;
+}
+void Video360::Seek(double deltaSeconds) {
+    Impl& impl = *m_impl;
+    if (!impl.started || impl.decodeDone) return;
+    std::lock_guard<std::mutex> lock(impl.mutex);
+    double target = impl.playbackTime + deltaSeconds;
+    if (target < 0.0) target = 0.0;
+    if (impl.durationSeconds > 0.0 && target > impl.durationSeconds) target = impl.durationSeconds;
+    impl.seekTargetPts = (int64_t)(target / impl.timeBase);
+    impl.seekPending = true;
+}
 std::string Video360::CodecName() const { return m_impl->codecName; }
 PanoLayout Video360::DetectedLayout() const { return m_impl->layout; }
 bool Video360::FullRange() const { return m_impl->fullRange; }

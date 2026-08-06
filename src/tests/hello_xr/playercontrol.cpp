@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "playercontrol.h"
 
+#include <chrono>
 #include <cstdio>
 
 #if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
@@ -22,6 +23,18 @@ std::atomic<int> g_rateIndex{kNormalRateIndex};
 std::atomic<bool> g_paused{false};
 std::atomic<bool> g_nextTrack{false};
 std::atomic<bool> g_quit{false};
+std::atomic<int> g_seekJumpSeconds{0};
+
+// Milliseconds since steady_clock's epoch. 0 means "never" (SecondsSinceLastInteraction()
+// then returns a large number, which is what "never touched" should look like to the
+// progress-bar auto-hide timer).
+std::atomic<int64_t> g_lastInteractionMs{0};
+
+void TouchInteraction() {
+    g_lastInteractionMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+}
 
 #if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
 termios g_savedTermios{};
@@ -44,6 +57,7 @@ bool IsPaused() { return g_paused; }
 
 void TogglePause() {
     g_paused = !g_paused;
+    TouchInteraction();
     ReportRate();
 }
 
@@ -51,6 +65,7 @@ void Slower() {
     int i = g_rateIndex.load();
     if (i > 0) g_rateIndex = i - 1;
     g_paused = false;
+    TouchInteraction();
     ReportRate();
 }
 
@@ -58,16 +73,35 @@ void Faster() {
     int i = g_rateIndex.load();
     if (i < kRateCount - 1) g_rateIndex = i + 1;
     g_paused = false;
+    TouchInteraction();
     ReportRate();
 }
 
 void NormalSpeed() {
     g_rateIndex = kNormalRateIndex;
     g_paused = false;
+    TouchInteraction();
     ReportRate();
 }
 
 bool TakeNextTrackRequest() { return g_nextTrack.exchange(false); }
+
+int TakeSeekRequest() { return g_seekJumpSeconds.exchange(0); }
+
+void QueueSeek(int seconds) {
+    g_seekJumpSeconds += seconds;
+    TouchInteraction();
+    Log::Write(Log::Level::Info, Fmt("player: seek %+ds", seconds));
+}
+
+double SecondsSinceLastInteraction() {
+    const int64_t last = g_lastInteractionMs.load();
+    if (last == 0) return 1e9;  // never touched - "a long time ago" for the auto-hide timer
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+    return (double)(now - last) / 1000.0;
+}
 
 bool QuitRequested() { return g_quit; }
 
@@ -89,6 +123,14 @@ bool HandleKey(int c) {
             return true;
         case '1':
             NormalSpeed();
+            return true;
+        case 'h':
+        case 'H':
+            QueueSeek(-10);
+            return true;
+        case 'l':
+        case 'L':
+            QueueSeek(10);
             return true;
         case 'n':
         case 'N':
@@ -133,7 +175,7 @@ void EndRawInput() {
 }
 
 const char* HelpLine() {
-    return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   n siguiente   q salir";
+    return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   h/l -10s/+10s   n siguiente   q salir";
 }
 
 }  // namespace PlayerControl

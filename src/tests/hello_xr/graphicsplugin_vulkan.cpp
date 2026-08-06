@@ -1666,6 +1666,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             // device idle plus reallocation - but it only happens between videos, and the next
             // file may have a different resolution, so there is nothing to reuse.
             m_video->SetRate(PlayerControl::Rate());
+            const int seekJump = PlayerControl::TakeSeekRequest();
+            if (seekJump != 0) m_video->Seek((double)seekJump);
             const bool skip = PlayerControl::TakeNextTrackRequest() && m_playlist.size() > 1;
             if (skip || (m_playlist.size() > 1 && m_video->Finished())) AdvanceTrack();
             if (m_videoMode) UpdateVideoTexture();
@@ -1787,6 +1789,21 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         pushConstants.mode[0] = (m_panoLayout.projection == PanoProjection::HalfEquirect180)   ? 1
                                 : (m_panoLayout.projection == PanoProjection::Flat)           ? 2
                                                                                               : 0;
+        // Progress bar (see frag.glsl): mode.y is fill fraction *1000, mode.z is visibility
+        // alpha *255. Only shown for a few seconds after the last transport-control touch, so
+        // it doesn't sit on screen the whole time someone is just watching.
+        pushConstants.mode[1] = 0;
+        pushConstants.mode[2] = 0;
+        if (m_videoMode && m_video) {
+            const double duration = m_video->Duration();
+            if (duration > 0.0) {
+                double frac = m_video->PlaybackPosition() / duration;
+                if (frac < 0.0) frac = 0.0;
+                if (frac > 1.0) frac = 1.0;
+                pushConstants.mode[1] = (int32_t)(frac * 1000.0);
+            }
+            pushConstants.mode[2] = (PlayerControl::SecondsSinceLastInteraction() < 3.0) ? 255 : 0;
+        }
         vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(pushConstants), &pushConstants);
 

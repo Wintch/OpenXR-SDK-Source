@@ -88,6 +88,19 @@ class Video360 {
     // Frames per second the file declares. Useful to sanity-check what the pipeline sustains.
     double FrameRate() const;
 
+    // Total length of the file in seconds, or 0 if the container did not say. For a progress
+    // indicator.
+    double Duration() const;
+
+    // Where the playback clock is right now, in seconds. Safe to call from any thread.
+    double PlaybackPosition() const;
+
+    // Jumps the playback position by deltaSeconds (negative to go back), clamped to
+    // [0, Duration()]. Safe to call from any thread; takes effect on the decode thread's next
+    // loop iteration, not synchronously. A no-op before Start() or after the file has finished
+    // (non-looping playlists).
+    void Seek(double deltaSeconds);
+
     // Name of the video codec, for the "now playing" banner.
     std::string CodecName() const;
 
