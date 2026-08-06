@@ -83,17 +83,41 @@ void main()
     dx *= ubuf.uvScaleOffset.xy;
     dy *= ubuf.uvScaleOffset.xy;
 
-    FragColor = vec4(textureGrad(equirectTex, uv, dx, dy).rgb * inside, 1.0);
+    // Progress bar and quit-hold bar (see below) draw over their screen-space strip whether or
+    // not it's `inside` - a bar should never vanish just because it happens to fall outside the
+    // content area (letterboxing in flat mode, the void beyond a 180 frame's edge, etc).
+    float barAlpha = float(ubuf.mode.z) / 255.0;
+    bool inProgressBar = barAlpha > 0.0 && t > 0.94 && t < 0.98;
+    float quitHold = float(ubuf.mode.w) / 1000.0;
+    bool inQuitFill = quitHold > 0.0 && t > 0.02 && t < 0.06 && s < quitHold;
+
+    // Genuinely empty space (no content, no bar) is left to whatever the app cleared the frame
+    // to (see GetBackgroundClearColor() in openxr_program.cpp / HELLO_XR_THEME) instead of
+    // being painted black here - so it discards rather than writing a color.
+    if (inside < 0.5 && !inProgressBar && !inQuitFill) {
+        discard;
+    }
+
+    FragColor = vec4(inside > 0.5 ? textureGrad(equirectTex, uv, dx, dy).rgb : vec3(0.0), 1.0);
 
     // Progress bar: a thin strip near the bottom of the screen, drawn straight in screen
     // space (not projected onto the pano), so it stays flat and legible no matter what
     // projection mode is active or what direction you're looking. mode.y/mode.z aren't used
     // by anything above - reusing them here instead of growing the push-constant struct past
     // the 128 bytes Vulkan guarantees (it's already exactly at that limit).
-    float barAlpha = float(ubuf.mode.z) / 255.0;
-    if (barAlpha > 0.0 && t > 0.94 && t < 0.98) {
+    if (inProgressBar) {
         float progress = float(ubuf.mode.y) / 1000.0;
         vec3 barColor = (s < progress) ? vec3(1.0, 1.0, 1.0) : vec3(0.35, 0.35, 0.35);
         FragColor.rgb = mix(FragColor.rgb, barColor, barAlpha);
+    }
+
+    // Quit-confirm hold: a red-orange bar near the TOP that fills left-to-right while the WMR
+    // Menu button is held (openxr_program.cpp's hold-to-confirm timer). Opposite edge from the
+    // playback progress bar above so the two can never be confused for one another; always
+    // full alpha while holding, since unlike the progress bar there is no need to auto-hide
+    // something that is only ever visible while actively held.
+    if (inQuitFill) {
+        vec3 quitColor = vec3(1.0, 0.25, 0.15);
+        FragColor.rgb = mix(FragColor.rgb, quitColor, 0.9);
     }
 }

@@ -4,12 +4,13 @@
 // consumer sits deep inside the render loop, so the state between them is a small set of
 // atomics rather than a parameter threaded through the graphics plugin interface.
 //
-//   space   pause / resume
+//   space   pause / resume (also: WMR controller trigger)
 //   [  ]    slower / faster (1x, 0.5x, 0.25x, 2x ...)
 //   1       back to normal speed
-//   h  l    seek -10s / +10s
+//   h  l    seek -10s / +10s (also: WMR controller thumbstick)
+//   enter   recenter forward (also: WMR controller squeeze/grip)
 //   n       next file in the playlist
-//   q ESC   quit
+//   q ESC   quit (also: hold the WMR Menu button ~1.5s)
 
 #pragma once
 
@@ -43,6 +44,21 @@ double SecondsSinceLastInteraction();
 
 // True once a quit key has been pressed.
 bool QuitRequested();
+
+// How far into the hold-to-confirm quit gesture the WMR Menu button is (0..1), written by
+// openxr_program.cpp's PollActions each frame and read by the renderer for the on-screen
+// hold indicator. 0 when Menu isn't held or the hold was released early.
+void SetQuitHoldFraction(double frac);
+int QuitHoldPermille();
+
+// Recenter: squeeze/grip (either hand) resets "forward" to wherever you're currently facing,
+// same idea as the recenter button most 360 video players have. Requested by the input-poll
+// side; the renderer (which is the only place that has the current head pose) does the actual
+// yaw capture and clears the request.
+void RequestRecenter();
+bool TakeRecenterRequest();
+void SetRecenterYaw(double radians);
+double RecenterYaw();
 
 // Feeds one character from the terminal. Returns false if the key was not a control key,
 // so the caller can decide what to do with it.

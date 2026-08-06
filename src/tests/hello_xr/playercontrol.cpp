@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 
 #if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
 #include <termios.h>
@@ -24,6 +25,11 @@ std::atomic<bool> g_paused{false};
 std::atomic<bool> g_nextTrack{false};
 std::atomic<bool> g_quit{false};
 std::atomic<int> g_seekJumpSeconds{0};
+std::atomic<int> g_quitHoldPermille{0};
+std::atomic<bool> g_recenterRequested{false};
+// Stored as bit-pattern-in-an-int64 (via memcpy) rather than std::atomic<double>, which isn't
+// guaranteed lock-free on every platform this builds for; this is - matches g_lastInteractionMs.
+std::atomic<int64_t> g_recenterYawBits{0};
 
 // Milliseconds since steady_clock's epoch. 0 means "never" (SecondsSinceLastInteraction()
 // then returns a large number, which is what "never touched" should look like to the
@@ -105,6 +111,35 @@ double SecondsSinceLastInteraction() {
 
 bool QuitRequested() { return g_quit; }
 
+void SetQuitHoldFraction(double frac) {
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 1.0) frac = 1.0;
+    g_quitHoldPermille = (int)(frac * 1000.0);
+}
+
+int QuitHoldPermille() { return g_quitHoldPermille.load(); }
+
+void RequestRecenter() {
+    g_recenterRequested = true;
+    TouchInteraction();
+    Log::Write(Log::Level::Info, "player: recenter");
+}
+
+bool TakeRecenterRequest() { return g_recenterRequested.exchange(false); }
+
+void SetRecenterYaw(double radians) {
+    int64_t bits;
+    std::memcpy(&bits, &radians, sizeof(bits));
+    g_recenterYawBits = bits;
+}
+
+double RecenterYaw() {
+    const int64_t bits = g_recenterYawBits.load();
+    double radians;
+    std::memcpy(&radians, &bits, sizeof(radians));
+    return radians;
+}
+
 bool HandleKey(int c) {
     switch (c) {
         case ' ':
@@ -131,6 +166,10 @@ bool HandleKey(int c) {
         case 'l':
         case 'L':
             QueueSeek(10);
+            return true;
+        case '\r':
+        case '\n':
+            RequestRecenter();
             return true;
         case 'n':
         case 'N':
@@ -175,7 +214,9 @@ void EndRawInput() {
 }
 
 const char* HelpLine() {
-    return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   h/l -10s/+10s   n siguiente   q salir";
+    return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   h/l -10s/+10s   enter recentra   "
+           "n siguiente   q salir "
+           "(mando WMR: trigger pausa, stick seek, grip recentra, mantener Menu ~1.5s sale)";
 }
 
 }  // namespace PlayerControl

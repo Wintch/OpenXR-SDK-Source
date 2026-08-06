@@ -1738,6 +1738,27 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
         }
 
+        // Recenter: yaw-only, captured from whichever direction is "forward" right now (same
+        // azimuth convention as frag.glsl's `az = atan(dir.x, -dir.z)`) so that direction reads
+        // as dead ahead afterwards. Pitch/roll are left alone - those already track the real
+        // headset, recentering them would fight the HMD's own leveling. Captured once per frame
+        // (eye == 0) since recenterAction's request is consumed (exchanged to false) on read.
+        if (eye == 0 && PlayerControl::TakeRecenterRequest()) {
+            XrVector3f forward{0.0f, 0.0f, -1.0f};
+            XrVector3f worldForward;
+            XrQuaternionf_RotateVector3f(&worldForward, &pose.orientation, &forward);
+            PlayerControl::SetRecenterYaw(atan2((double)worldForward.x, -(double)worldForward.z));
+        }
+        const double recenterYaw = PlayerControl::RecenterYaw();
+        if (recenterYaw != 0.0) {
+            XrVector3f yAxis{0.0f, 1.0f, 0.0f};
+            XrQuaternionf yawOffset;
+            XrQuaternionf_CreateFromAxisAngle(&yawOffset, &yAxis, (float)-recenterYaw);
+            XrQuaternionf adjusted;
+            XrQuaternionf_Multiply(&adjusted, &pose.orientation, &yawOffset);
+            pose.orientation = adjusted;
+        }
+
         // Tracking-stability instrumentation (HELLO_XR_POSE_STATS=1): reports the achieved frame
         // rate and how far the reported orientation moves between frames. Held still, the
         // inter-frame rotation is the tracker's jitter floor.
@@ -1794,6 +1815,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // it doesn't sit on screen the whole time someone is just watching.
         pushConstants.mode[1] = 0;
         pushConstants.mode[2] = 0;
+        // Quit-confirm hold indicator (see frag.glsl): mode.w is the hold fraction *1000, set
+        // by openxr_program.cpp's PollActions while the WMR Menu button is held down. Not
+        // gated on m_videoMode - quitting applies in photo mode too.
+        pushConstants.mode[3] = PlayerControl::QuitHoldPermille();
         if (m_videoMode && m_video) {
             const double duration = m_video->Duration();
             if (duration > 0.0) {
