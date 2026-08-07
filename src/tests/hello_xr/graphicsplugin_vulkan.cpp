@@ -1668,6 +1668,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             m_video->SetRate(PlayerControl::Rate());
             const int seekJump = PlayerControl::TakeSeekRequest();
             if (seekJump != 0) m_video->Seek((double)seekJump);
+            const int frameStep = PlayerControl::TakeFrameStepRequest();
+            if (frameStep != 0 && m_video->FrameRate() > 0.0) {
+                m_video->Seek(frameStep / m_video->FrameRate());
+            }
             const bool skip = PlayerControl::TakeNextTrackRequest() && m_playlist.size() > 1;
             if (skip || (m_playlist.size() > 1 && m_video->Finished())) AdvanceTrack();
             if (m_videoMode) UpdateVideoTexture();

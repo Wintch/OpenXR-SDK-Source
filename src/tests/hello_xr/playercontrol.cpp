@@ -25,6 +25,7 @@ std::atomic<bool> g_paused{false};
 std::atomic<bool> g_nextTrack{false};
 std::atomic<bool> g_quit{false};
 std::atomic<int> g_seekJumpSeconds{0};
+std::atomic<int> g_frameStepRequest{0};
 std::atomic<int> g_quitHoldPermille{0};
 std::atomic<bool> g_recenterRequested{false};
 // Stored as bit-pattern-in-an-int64 (via memcpy) rather than std::atomic<double>, which isn't
@@ -100,6 +101,15 @@ void QueueSeek(int seconds) {
     Log::Write(Log::Level::Info, Fmt("player: seek %+ds", seconds));
 }
 
+int TakeFrameStepRequest() { return g_frameStepRequest.exchange(0); }
+
+void StepFrame(int frames) {
+    g_paused = true;
+    g_frameStepRequest += frames;
+    TouchInteraction();
+    Log::Write(Log::Level::Info, Fmt("player: frame %+d", frames));
+}
+
 double SecondsSinceLastInteraction() {
     const int64_t last = g_lastInteractionMs.load();
     if (last == 0) return 1e9;  // never touched - "a long time ago" for the auto-hide timer
@@ -167,6 +177,12 @@ bool HandleKey(int c) {
         case 'L':
             QueueSeek(10);
             return true;
+        case '<':
+            StepFrame(-1);
+            return true;
+        case '>':
+            StepFrame(1);
+            return true;
         case '\r':
         case '\n':
             RequestRecenter();
@@ -214,7 +230,8 @@ void EndRawInput() {
 }
 
 const char* HelpLine() {
-    return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   h/l -10s/+10s   enter recentra   "
+    return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   h/l -10s/+10s   "
+           "<-/-> (o < >) frame a frame   enter recentra   "
            "n siguiente   q salir "
            "(mando WMR: trigger pausa, stick seek, grip recentra, mantener Menu ~1.5s sale)";
 }

@@ -13,6 +13,11 @@
 
 #include <cstdlib>
 
+#if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
+#include <poll.h>
+#include <unistd.h>
+#endif
+
 #if defined(_WIN32)
 // Favor the high performance NVIDIA or AMD GPUs
 extern "C" {
@@ -310,6 +315,42 @@ int main(int argc, char* argv[]) {
             Log::Write(Log::Level::Info, PlayerControl::HelpLine());
             while (!quitKeyPressed) {
                 const int c = getchar();
+#if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
+                // Arrow keys arrive as the 3-byte escape sequence ESC '[' C/D. ESC alone is
+                // also the quit key, so on ESC we peek for more bytes with a short poll()
+                // timeout instead of assuming: a real Escape keypress has nothing following
+                // it, while an arrow key's remaining bytes are already sitting in the
+                // terminal's input buffer by the time we get here (the pty writes all three
+                // as one burst). Left/right also has plain '<'/'>' as a keyboard-only
+                // fallback in HandleKey, in case a given terminal encodes arrows differently.
+                if (c == 27 && isatty(STDIN_FILENO)) {
+                    pollfd pfd{STDIN_FILENO, POLLIN, 0};
+                    if (poll(&pfd, 1, 30) > 0) {
+                        const int c2 = getchar();
+                        if (c2 == '[') {
+                            pollfd pfd2{STDIN_FILENO, POLLIN, 0};
+                            if (poll(&pfd2, 1, 30) > 0) {
+                                const int c3 = getchar();
+                                if (c3 == 'C') {
+                                    PlayerControl::StepFrame(1);
+                                } else if (c3 == 'D') {
+                                    PlayerControl::StepFrame(-1);
+                                }
+                                // any other CSI sequence (up/down, Home/End, F-keys...): not
+                                // handled, just swallowed along with its introducer bytes.
+                            }
+                            continue;
+                        }
+                        // ESC followed by something that isn't '[': treat the ESC as the
+                        // real quit keypress it looks like, then let the next byte act too.
+                        PlayerControl::HandleKey(27);
+                        if (PlayerControl::QuitRequested()) quitKeyPressed = true;
+                        PlayerControl::HandleKey(c2);
+                        if (PlayerControl::QuitRequested()) quitKeyPressed = true;
+                        continue;
+                    }
+                }
+#endif
                 PlayerControl::HandleKey(c);
                 if (PlayerControl::QuitRequested()) quitKeyPressed = true;
                 if (c == EOF) break;
