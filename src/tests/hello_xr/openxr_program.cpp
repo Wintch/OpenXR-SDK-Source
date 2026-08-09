@@ -98,6 +98,13 @@ struct OpenXrProgram : IOpenXrProgram {
         : m_platformPlugin(platformPlugin), m_graphicsPlugin(graphicsPlugin) {}
 
     ~OpenXrProgram() override {
+        // Found 2026-08-09: destroying the swapchain/session/instance below with GPU work
+        // from the last rendered frame(s) still in flight is a Vulkan validation error, not
+        // a harmless race - it hung the process outright at least once, reproduced live with
+        // a real controller-driven quit. Usually the GPU had already caught up by the time a
+        // session ended, which is why this went unnoticed for a while.
+        if (m_graphicsPlugin) m_graphicsPlugin->WaitForGpuIdle();
+
         if (m_input.actionSet != XR_NULL_HANDLE) {
             for (auto hand : {Side::LEFT, Side::RIGHT}) {
                 xrDestroySpace(m_input.handSpace[hand]);
@@ -300,9 +307,12 @@ struct OpenXrProgram : IOpenXrProgram {
         // (see frag.glsl) instead of painting them black, so this color is what shows in that
         // empty space - previously it was set but never visible, since the shader used to
         // cover every pixel regardless. HELLO_XR_THEME picks it: "night" (or the older "void")
-        // is the original black look, anything else (default "daylight") is a plain medium
-        // grey, added because pure black outside the frame reads as "did tracking break?"
-        // rather than "empty".
+        // is the original black look, "daylight" is a plain medium grey (added because pure
+        // black outside the frame reads as "did tracking break?" rather than "empty" - but
+        // found 2026-08-09, VR180 content: that grey covers the entire back 180 degrees, and
+        // the user's call was that of the two options, all-black reads better than all-grey
+        // there - so black is the default now; pass HELLO_XR_THEME=daylight to get the grey
+        // back).
         static const std::array<float, 4> Night{{0.0f, 0.0f, 0.0f, 1.0f}};
         static const std::array<float, 4> Daylight{{0.5f, 0.5f, 0.5f, 1.0f}};
         static const std::array<float, 4> TransparentBlack{{0.0f, 0.0f, 0.0f, 0.0f}};
@@ -311,8 +321,8 @@ struct OpenXrProgram : IOpenXrProgram {
         switch (m_blendMode) {
             case XR_ENVIRONMENT_BLEND_MODE_OPAQUE: {
                 const char* theme = getenv("HELLO_XR_THEME");
-                const bool night = theme != nullptr && (strcmp(theme, "night") == 0 || strcmp(theme, "void") == 0);
-                return night ? Night : Daylight;
+                const bool daylight = theme != nullptr && strcmp(theme, "daylight") == 0;
+                return daylight ? Daylight : Night;
             }
             case XR_ENVIRONMENT_BLEND_MODE_ADDITIVE:
                 return Black;
@@ -420,6 +430,9 @@ struct OpenXrProgram : IOpenXrProgram {
         // of A/B (which are right-hand-only), and was the last free real input. Next track in
         // a directory playlist - previously keyboard-only ('n'), useless with the headset on.
         XrAction nextTrackAction{XR_NULL_HANDLE};
+        // X click, same profile/hand as Y above - the other left-hand face button. Previous
+        // track, the direction Y doesn't cover.
+        XrAction prevTrackAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
         std::array<float, Side::COUNT> handScale = {{1.0f, 1.0f}};
@@ -535,6 +548,14 @@ struct OpenXrProgram : IOpenXrProgram {
             actionInfo.countSubactionPaths = 0;
             actionInfo.subactionPaths = nullptr;
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.nextTrackAction));
+
+            // X click for previous track (see InputState::prevTrackAction) - left hand only.
+            actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+            strcpy_s(actionInfo.actionName, "prev_track");
+            strcpy_s(actionInfo.localizedActionName, "Previous Track");
+            actionInfo.countSubactionPaths = 0;
+            actionInfo.subactionPaths = nullptr;
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.prevTrackAction));
         }
 
         std::array<XrPath, Side::COUNT> selectPath;
@@ -547,6 +568,7 @@ struct OpenXrProgram : IOpenXrProgram {
         std::array<XrPath, Side::COUNT> bClickPath;
         std::array<XrPath, Side::COUNT> aClickPath;
         std::array<XrPath, Side::COUNT> yClickPath;
+        std::array<XrPath, Side::COUNT> xClickPath;
         std::array<XrPath, Side::COUNT> triggerValuePath;
         std::array<XrPath, Side::COUNT> thumbstickXPath;
         std::array<XrPath, Side::COUNT> thumbstickYPath;
@@ -571,6 +593,8 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/a/click", &aClickPath[Side::RIGHT]));
         // Mirror of the above: y/click only exists on the left hand.
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/y/click", &yClickPath[Side::LEFT]));
+        // Same story for x/click - left hand only.
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/x/click", &xClickPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/trigger/value", &triggerValuePath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/trigger/value", &triggerValuePath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick/x", &thumbstickXPath[Side::LEFT]));
@@ -625,7 +649,8 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.recenterAction, squeezeValuePath[Side::RIGHT]},
                                                             {m_input.brightnessUpAction, aClickPath[Side::RIGHT]},
                                                             {m_input.brightnessDownAction, bClickPath[Side::RIGHT]},
-                                                            {m_input.nextTrackAction, yClickPath[Side::LEFT]}}};
+                                                            {m_input.nextTrackAction, yClickPath[Side::LEFT]},
+                                                            {m_input.prevTrackAction, xClickPath[Side::LEFT]}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
             suggestedBindings.suggestedBindings = bindings.data();
@@ -965,6 +990,7 @@ struct OpenXrProgram : IOpenXrProgram {
                     LogActionSourceName(m_input.brightnessUpAction, "BrightnessUp");
                     LogActionSourceName(m_input.brightnessDownAction, "BrightnessDown");
                     LogActionSourceName(m_input.nextTrackAction, "NextTrack");
+                    LogActionSourceName(m_input.prevTrackAction, "PrevTrack");
                     break;
                 case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
                 default: {
@@ -1184,6 +1210,21 @@ struct OpenXrProgram : IOpenXrProgram {
             PlayerControl::SetQuitHoldFraction(0.0);
         }
 
+        // Bug found 2026-08-09: PlayerControl::g_quit (set by keyboard q/ESC/EOF, and by
+        // MaybeQuitOnAnyKey() under HELLO_XR_ANY_KEY_QUITS=1) used to only be watched by
+        // main.cpp's keyboard-reading thread - which sits blocked in getchar() the entire
+        // time in a controller-only session, so it never actually noticed. User report:
+        // "zoom, menu, recenter works, brightness works, but nothing triggers playing
+        // video" - zoom/recenter/brightness all correctly set g_quit via MaybeQuitOnAnyKey(),
+        // but nothing was polling for it here. g_quit is never cleared once set, and this
+        // runs every frame, so latch the call - a second xrRequestExitSession() once the
+        // session has left RUNNING is a spec error, not a harmless no-op.
+        static bool exitSessionRequested = false;
+        if (!exitSessionRequested && PlayerControl::QuitRequested()) {
+            CHECK_XRCMD(xrRequestExitSession(m_session));
+            exitSessionRequested = true;
+        }
+
         // Recenter: no subaction paths, same "don't care which hand" shape as quit.
         XrActionStateGetInfo recenterGetInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.recenterAction,
                                              XR_NULL_PATH};
@@ -1222,6 +1263,16 @@ struct OpenXrProgram : IOpenXrProgram {
         if ((nextTrackValue.isActive == XR_TRUE) && (nextTrackValue.changedSinceLastSync == XR_TRUE) &&
             (nextTrackValue.currentState == XR_TRUE)) {
             PlayerControl::RequestNextTrack();
+        }
+
+        // Previous track: X on the left Touch controller, same edge-triggered shape.
+        XrActionStateGetInfo prevTrackGetInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.prevTrackAction,
+                                              XR_NULL_PATH};
+        XrActionStateBoolean prevTrackValue{XR_TYPE_ACTION_STATE_BOOLEAN};
+        CHECK_XRCMD(xrGetActionStateBoolean(m_session, &prevTrackGetInfo, &prevTrackValue));
+        if ((prevTrackValue.isActive == XR_TRUE) && (prevTrackValue.changedSinceLastSync == XR_TRUE) &&
+            (prevTrackValue.currentState == XR_TRUE)) {
+            PlayerControl::RequestPreviousTrack();
         }
     }
 

@@ -529,6 +529,10 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         return nullptr;
     }
 
+    void WaitForGpuIdle() override {
+        if (m_vkDevice != VK_NULL_HANDLE) vkDeviceWaitIdle(m_vkDevice);
+    }
+
     void InitializeDevice(XrInstance instance, XrSystemId systemId) override {
         // Create the Vulkan device for the adapter associated with the system.
         // Extension function must be loaded by name
@@ -1217,6 +1221,21 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         Log::Write(Log::Level::Error, "playlist: no file in the list could be opened, stopping playback");
     }
 
+    // Mirror of AdvanceTrack(), other direction. `count - 1` instead of `-1` because
+    // m_playlistIndex is unsigned - going below 0 would wrap to a huge number, not -1.
+    void PreviousTrack() {
+        const size_t count = m_playlist.size();
+        for (size_t attempt = 0; attempt < count; attempt++) {
+            DestroyVideoResources();
+            m_videoMode = false;
+            m_playlistIndex = (m_playlistIndex + count - 1) % count;
+            Log::Write(Log::Level::Info, Fmt("playlist: %zu/%zu", m_playlistIndex + 1, count));
+            if (OpenVideoTexture(m_playlist[m_playlistIndex])) return;
+            Log::Write(Log::Level::Warning, Fmt("playlist: skipping '%s'", m_playlist[m_playlistIndex].c_str()));
+        }
+        Log::Write(Log::Level::Error, "playlist: no file in the list could be opened, stopping playback");
+    }
+
     bool OpenVideoTexture(const std::string& path) {
         m_video = std::make_unique<Video360>();
         if (!m_video->Open(path)) return false;
@@ -1673,7 +1692,12 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 m_video->Seek(frameStep / m_video->FrameRate());
             }
             const bool skip = PlayerControl::TakeNextTrackRequest() && m_playlist.size() > 1;
-            if (skip || (m_playlist.size() > 1 && m_video->Finished())) AdvanceTrack();
+            const bool back = PlayerControl::TakePreviousTrackRequest() && m_playlist.size() > 1;
+            if (back) {
+                PreviousTrack();
+            } else if (skip || (m_playlist.size() > 1 && m_video->Finished())) {
+                AdvanceTrack();
+            }
             if (m_videoMode) UpdateVideoTexture();
         }
 

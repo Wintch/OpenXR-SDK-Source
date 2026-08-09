@@ -23,6 +23,7 @@ constexpr int kNormalRateIndex = 3;
 std::atomic<int> g_rateIndex{kNormalRateIndex};
 std::atomic<bool> g_paused{false};
 std::atomic<bool> g_nextTrack{false};
+std::atomic<bool> g_prevTrack{false};
 std::atomic<bool> g_quit{false};
 std::atomic<int> g_seekJumpSeconds{0};
 std::atomic<int> g_frameStepRequest{0};
@@ -59,6 +60,15 @@ void TouchInteraction() {
                                .count();
 }
 
+std::atomic<bool> g_anyKeyQuits{false};
+
+// Called from every action below except the ones Menu's own hold-to-quit gesture already
+// covers. Deliberately separate from TouchInteraction() - zoom/brightness intentionally
+// don't touch the progress-bar timer, but should still count as "a key was pressed" here.
+void MaybeQuitOnAnyKey() {
+    if (g_anyKeyQuits.load()) g_quit = true;
+}
+
 #if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
 termios g_savedTermios{};
 bool g_rawActive = false;
@@ -81,6 +91,7 @@ bool IsPaused() { return g_paused; }
 void TogglePause() {
     g_paused = !g_paused;
     TouchInteraction();
+    MaybeQuitOnAnyKey();
     ReportRate();
 }
 
@@ -89,6 +100,7 @@ void Slower() {
     if (i > 0) g_rateIndex = i - 1;
     g_paused = false;
     TouchInteraction();
+    MaybeQuitOnAnyKey();
     ReportRate();
 }
 
@@ -97,6 +109,7 @@ void Faster() {
     if (i < kRateCount - 1) g_rateIndex = i + 1;
     g_paused = false;
     TouchInteraction();
+    MaybeQuitOnAnyKey();
     ReportRate();
 }
 
@@ -104,6 +117,7 @@ void NormalSpeed() {
     g_rateIndex = kNormalRateIndex;
     g_paused = false;
     TouchInteraction();
+    MaybeQuitOnAnyKey();
     ReportRate();
 }
 
@@ -112,7 +126,17 @@ bool TakeNextTrackRequest() { return g_nextTrack.exchange(false); }
 void RequestNextTrack() {
     g_nextTrack = true;
     TouchInteraction();
+    MaybeQuitOnAnyKey();
     Log::Write(Log::Level::Info, "player: siguiente");
+}
+
+bool TakePreviousTrackRequest() { return g_prevTrack.exchange(false); }
+
+void RequestPreviousTrack() {
+    g_prevTrack = true;
+    TouchInteraction();
+    MaybeQuitOnAnyKey();
+    Log::Write(Log::Level::Info, "player: anterior");
 }
 
 int TakeSeekRequest() { return g_seekJumpSeconds.exchange(0); }
@@ -120,6 +144,7 @@ int TakeSeekRequest() { return g_seekJumpSeconds.exchange(0); }
 void QueueSeek(int seconds) {
     g_seekJumpSeconds += seconds;
     TouchInteraction();
+    MaybeQuitOnAnyKey();
     Log::Write(Log::Level::Info, Fmt("player: seek %+ds", seconds));
 }
 
@@ -129,6 +154,7 @@ void StepFrame(int frames) {
     g_paused = true;
     g_frameStepRequest += frames;
     TouchInteraction();
+    MaybeQuitOnAnyKey();
     Log::Write(Log::Level::Info, Fmt("player: frame %+d", frames));
 }
 
@@ -147,7 +173,12 @@ void SetZoom(double z) {
     int64_t bits;
     std::memcpy(&bits, &z, sizeof(bits));
     g_zoomBits = bits;
-    TouchInteraction();
+    // No TouchInteraction() here on purpose (found 2026-08-09): zoom and brightness are
+    // display/image settings, not playback-position controls - SecondsSinceLastInteraction()
+    // exists specifically to drive the progress bar's auto-hide timer, and the user does not
+    // want that bar flashing on screen just because they adjusted zoom or brightness.
+    // MaybeQuitOnAnyKey() is unrelated to that and still applies - see its own comment.
+    MaybeQuitOnAnyKey();
     Log::Write(Log::Level::Info, Fmt("player: zoom %.2fx", z));
 }
 }  // namespace
@@ -171,7 +202,9 @@ void SetBrightness(double b) {
     int64_t bits;
     std::memcpy(&bits, &b, sizeof(bits));
     g_brightnessBits = bits;
-    TouchInteraction();
+    // No TouchInteraction() - see the same note in SetZoom() above. MaybeQuitOnAnyKey()
+    // still applies.
+    MaybeQuitOnAnyKey();
     Log::Write(Log::Level::Info, Fmt("player: brillo %.2fx", b));
 }
 }  // namespace
@@ -191,6 +224,8 @@ double SecondsSinceLastInteraction() {
 
 bool QuitRequested() { return g_quit; }
 
+void SetAnyKeyQuits(bool on) { g_anyKeyQuits = on; }
+
 void SetQuitHoldFraction(double frac) {
     if (frac < 0.0) frac = 0.0;
     if (frac > 1.0) frac = 1.0;
@@ -202,6 +237,7 @@ int QuitHoldPermille() { return g_quitHoldPermille.load(); }
 void RequestRecenter() {
     g_recenterRequested = true;
     TouchInteraction();
+    MaybeQuitOnAnyKey();
     Log::Write(Log::Level::Info, "player: recenter");
 }
 
@@ -282,6 +318,10 @@ bool HandleKey(int c) {
         case 'N':
             RequestNextTrack();
             return true;
+        case 'p':
+        case 'P':
+            RequestPreviousTrack();
+            return true;
         case 'q':
         case 'Q':
         case 27:   // ESC
@@ -323,9 +363,10 @@ const char* HelpLine() {
     return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   h/l -10s/+10s   "
            "<-/-> (o < >) frame a frame   arriba/abajo (o ^ v) zoom   0 zoom normal   "
            "b/d brillo   9 brillo normal   "
-           "enter recentra   n siguiente   q salir "
+           "enter recentra   n siguiente   p anterior   q salir "
            "(mando WMR: trigger pausa, stick X seek, stick Y zoom, grip recentra, "
-           "A/B (der.) brillo, mantener Menu ~1.5s sale)";
+           "A/B (der.) brillo, Y (izq.) siguiente, X (izq.) anterior, "
+           "mantener Menu ~1.5s sale)";
 }
 
 }  // namespace PlayerControl

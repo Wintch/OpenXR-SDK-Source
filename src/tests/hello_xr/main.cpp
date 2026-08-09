@@ -12,11 +12,34 @@
 #include "playercontrol.h"
 
 #include <cstdlib>
+#include <cstring>
 
 #if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
 #include <poll.h>
 #include <unistd.h>
 #endif
+
+namespace {
+// One byte from stdin, deliberately via raw read(2) and NOT getchar(). Found 2026-08-09,
+// via gdb on a live hang: stdio's getchar() holds stdin's FILE lock for the whole blocking
+// read, and glibc's exit() -> _IO_flush_all() needs that same lock - so any exit that
+// happens while the keyboard thread is still parked in getchar() (i.e. every quit that
+// came from the CONTROLLER rather than a key: Menu hold, HELLO_XR_ANY_KEY_QUITS) was a
+// guaranteed deadlock inside exit(), with the XR session already ended and the process
+// refusing to die. Latent since the Menu-quit patch (0005) - masked until now because the
+// old `sleep N |` stdin pipe delivered EOF at N seconds and unblocked the thread late,
+// and interactive runs had timeout's SIGTERM as a backstop. A kernel-level read() holds
+// no user-space locks, so the thread can stay parked in it at exit() harmlessly forever.
+// Returns EOF on end-of-stream or error, matching what getchar() reported.
+int ReadKeyByte() {
+#if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
+    unsigned char b;
+    return (read(STDIN_FILENO, &b, 1) == 1) ? (int)b : EOF;
+#else
+    return getchar();
+#endif
+}
+}  // namespace
 
 #if defined(_WIN32)
 // Favor the high performance NVIDIA or AMD GPUs
@@ -305,16 +328,23 @@ int main(int argc, char* argv[]) {
         std::shared_ptr<PlatformData> data = std::make_shared<PlatformData>();
 
         // One thread reading stdin drives the transport controls. It used to be "any key
-        // quits"; now only q/ESC/EOF do, and the rest are pause, speed and track skip. On a
-        // pipe (the timed `sleep N | hello_xr` runs) there are no keys and getchar returns EOF
-        // when the pipe closes, which still ends the run exactly as before.
+        // quits"; now only q/ESC/EOF do, and the rest are pause, speed and track skip - unless
+        // HELLO_XR_ANY_KEY_QUITS=1 opts back into the old behavior (added 2026-08-09 for
+        // play-with-legend.sh's "press anything to get past the controls screen"; Menu's own
+        // hold-to-confirm gesture is untouched either way). On a pipe (the timed
+        // `sleep N | hello_xr` runs) there are no keys and getchar returns EOF when the pipe
+        // closes, which still ends the run exactly as before.
+        {
+            const char* anyKeyQuits = getenv("HELLO_XR_ANY_KEY_QUITS");
+            PlayerControl::SetAnyKeyQuits(anyKeyQuits != nullptr && strcmp(anyKeyQuits, "1") == 0);
+        }
         static bool quitKeyPressed = false;
         PlayerControl::BeginRawInput();
         std::atexit(PlayerControl::EndRawInput);
         auto exitPollingThread = std::thread{[] {
             Log::Write(Log::Level::Info, PlayerControl::HelpLine());
             while (!quitKeyPressed) {
-                const int c = getchar();
+                const int c = ReadKeyByte();
 #if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
                 // Arrow keys arrive as the 3-byte escape sequence ESC '[' A/B/C/D. ESC alone is
                 // also the quit key, so on ESC we peek for more bytes with a short poll()
@@ -327,11 +357,11 @@ int main(int argc, char* argv[]) {
                 if (c == 27 && isatty(STDIN_FILENO)) {
                     pollfd pfd{STDIN_FILENO, POLLIN, 0};
                     if (poll(&pfd, 1, 30) > 0) {
-                        const int c2 = getchar();
+                        const int c2 = ReadKeyByte();
                         if (c2 == '[') {
                             pollfd pfd2{STDIN_FILENO, POLLIN, 0};
                             if (poll(&pfd2, 1, 30) > 0) {
-                                const int c3 = getchar();
+                                const int c3 = ReadKeyByte();
                                 if (c3 == 'C') {
                                     PlayerControl::StepFrame(1);
                                 } else if (c3 == 'D') {

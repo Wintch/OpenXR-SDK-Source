@@ -23,6 +23,16 @@ struct IGraphicsPlugin {
     // Create an instance of this graphics api for the provided instance and systemId.
     virtual void InitializeDevice(XrInstance instance, XrSystemId systemId) = 0;
 
+    // Blocks until the GPU has finished all work submitted so far. Found 2026-08-09:
+    // ~OpenXrProgram() used to destroy the swapchain/session/instance with no such wait -
+    // usually harmless (the GPU had already caught up by the time cleanup ran), but with
+    // real controller-driven quits during a real session the app could reach here with a
+    // frame's work still in flight, and destroying command buffers/semaphores the GPU is
+    // still using is a validation error, not a no-op - it hung the process outright at
+    // least once. Default no-op so any future non-Vulkan backend isn't forced to implement
+    // this if it doesn't need the same kind of explicit wait.
+    virtual void WaitForGpuIdle() {}
+
     // Select the preferred swapchain format from the list of available formats.
     virtual int64_t SelectColorSwapchainFormat(bool throwIfNotFound, span<const int64_t> imageFormatArray) const = 0;
     virtual int64_t SelectDepthSwapchainFormat(bool throwIfNotFound, span<const int64_t> imageFormatArray) const = 0;

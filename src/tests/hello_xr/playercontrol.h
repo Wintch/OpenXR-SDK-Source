@@ -16,7 +16,8 @@
 //   b  d    brighter / dimmer (also: Touch controller A/B, right hand)
 //   9       back to normal brightness (1x)
 //   enter   recenter forward (also: WMR controller squeeze/grip)
-//   n       next file in the playlist
+//   n       next file in the playlist (also: Touch controller Y, left hand)
+//   p       previous file in the playlist (also: Touch controller X, left hand)
 //   q ESC   quit (also: hold the WMR Menu button ~1.5s)
 
 #pragma once
@@ -37,6 +38,10 @@ bool IsPaused();
 // when there is only one file.
 bool TakeNextTrackRequest();
 void RequestNextTrack();
+
+// Same shape, other direction: 'p' (also: Touch controller X, left hand).
+bool TakePreviousTrackRequest();
+void RequestPreviousTrack();
 
 // Seconds to jump the playback position by (negative = back), accumulated from 'h'/'l' and
 // controller thumbstick pushes since the last call. Cleared on read. 0 most of the time.
@@ -108,5 +113,13 @@ void EndRawInput();
 
 // One line describing the controls, for the startup banner.
 const char* HelpLine();
+
+// HELLO_XR_ANY_KEY_QUITS=1 (read once at startup - see main.cpp): every control listed
+// above, keyboard or controller, also quits - except Menu, which keeps its own dedicated
+// hold-to-confirm gesture untouched. Added 2026-08-09 for play-with-legend.sh: showing a
+// static "here's what everything does" image before real content, where the fastest way
+// out should be "press literally anything", not the same 1.5s hold used to end a real
+// session.
+void SetAnyKeyQuits(bool on);
 
 }  // namespace PlayerControl
