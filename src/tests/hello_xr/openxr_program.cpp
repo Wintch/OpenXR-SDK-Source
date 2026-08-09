@@ -416,6 +416,10 @@ struct OpenXrProgram : IOpenXrProgram {
         // physical inputs. Brightness on the displayed content.
         XrAction brightnessUpAction{XR_NULL_HANDLE};
         XrAction brightnessDownAction{XR_NULL_HANDLE};
+        // Y click, oculus/touch_controller ONLY, left hand only - Y is the left-hand mirror
+        // of A/B (which are right-hand-only), and was the last free real input. Next track in
+        // a directory playlist - previously keyboard-only ('n'), useless with the headset on.
+        XrAction nextTrackAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
         std::array<float, Side::COUNT> handScale = {{1.0f, 1.0f}};
@@ -523,6 +527,14 @@ struct OpenXrProgram : IOpenXrProgram {
             actionInfo.countSubactionPaths = 0;
             actionInfo.subactionPaths = nullptr;
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.brightnessDownAction));
+
+            // Y click for next track (see InputState::nextTrackAction) - left hand only.
+            actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+            strcpy_s(actionInfo.actionName, "next_track");
+            strcpy_s(actionInfo.localizedActionName, "Next Track");
+            actionInfo.countSubactionPaths = 0;
+            actionInfo.subactionPaths = nullptr;
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.nextTrackAction));
         }
 
         std::array<XrPath, Side::COUNT> selectPath;
@@ -534,6 +546,7 @@ struct OpenXrProgram : IOpenXrProgram {
         std::array<XrPath, Side::COUNT> menuClickPath;
         std::array<XrPath, Side::COUNT> bClickPath;
         std::array<XrPath, Side::COUNT> aClickPath;
+        std::array<XrPath, Side::COUNT> yClickPath;
         std::array<XrPath, Side::COUNT> triggerValuePath;
         std::array<XrPath, Side::COUNT> thumbstickXPath;
         std::array<XrPath, Side::COUNT> thumbstickYPath;
@@ -556,6 +569,8 @@ struct OpenXrProgram : IOpenXrProgram {
         // a/click only exists on the right hand on any profile in this file (Touch's left
         // controller has x/y, not a/b) - not bothering to resolve the left path at all.
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/a/click", &aClickPath[Side::RIGHT]));
+        // Mirror of the above: y/click only exists on the left hand.
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/y/click", &yClickPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/trigger/value", &triggerValuePath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/trigger/value", &triggerValuePath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick/x", &thumbstickXPath[Side::LEFT]));
@@ -609,7 +624,8 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.recenterAction, squeezeValuePath[Side::LEFT]},
                                                             {m_input.recenterAction, squeezeValuePath[Side::RIGHT]},
                                                             {m_input.brightnessUpAction, aClickPath[Side::RIGHT]},
-                                                            {m_input.brightnessDownAction, bClickPath[Side::RIGHT]}}};
+                                                            {m_input.brightnessDownAction, bClickPath[Side::RIGHT]},
+                                                            {m_input.nextTrackAction, yClickPath[Side::LEFT]}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
             suggestedBindings.suggestedBindings = bindings.data();
@@ -948,6 +964,7 @@ struct OpenXrProgram : IOpenXrProgram {
                     LogActionSourceName(m_input.recenterAction, "Recenter");
                     LogActionSourceName(m_input.brightnessUpAction, "BrightnessUp");
                     LogActionSourceName(m_input.brightnessDownAction, "BrightnessDown");
+                    LogActionSourceName(m_input.nextTrackAction, "NextTrack");
                     break;
                 case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
                 default: {
@@ -1195,6 +1212,16 @@ struct OpenXrProgram : IOpenXrProgram {
         if ((brightDownValue.isActive == XR_TRUE) && (brightDownValue.changedSinceLastSync == XR_TRUE) &&
             (brightDownValue.currentState == XR_TRUE)) {
             PlayerControl::BrightnessDown();
+        }
+
+        // Next track: Y on the left Touch controller, same edge-triggered shape.
+        XrActionStateGetInfo nextTrackGetInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.nextTrackAction,
+                                              XR_NULL_PATH};
+        XrActionStateBoolean nextTrackValue{XR_TYPE_ACTION_STATE_BOOLEAN};
+        CHECK_XRCMD(xrGetActionStateBoolean(m_session, &nextTrackGetInfo, &nextTrackValue));
+        if ((nextTrackValue.isActive == XR_TRUE) && (nextTrackValue.changedSinceLastSync == XR_TRUE) &&
+            (nextTrackValue.currentState == XR_TRUE)) {
+            PlayerControl::RequestNextTrack();
         }
     }
 

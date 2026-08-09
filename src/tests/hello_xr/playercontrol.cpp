@@ -109,6 +109,12 @@ void NormalSpeed() {
 
 bool TakeNextTrackRequest() { return g_nextTrack.exchange(false); }
 
+void RequestNextTrack() {
+    g_nextTrack = true;
+    TouchInteraction();
+    Log::Write(Log::Level::Info, "player: siguiente");
+}
+
 int TakeSeekRequest() { return g_seekJumpSeconds.exchange(0); }
 
 void QueueSeek(int seconds) {
@@ -274,8 +280,7 @@ bool HandleKey(int c) {
             return true;
         case 'n':
         case 'N':
-            g_nextTrack = true;
-            Log::Write(Log::Level::Info, "player: siguiente");
+            RequestNextTrack();
             return true;
         case 'q':
         case 'Q':

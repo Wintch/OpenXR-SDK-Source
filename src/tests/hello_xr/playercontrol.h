@@ -33,8 +33,10 @@ void Faster();
 void NormalSpeed();
 bool IsPaused();
 
-// Set by 'n', cleared by whoever acts on it. Ignored when there is only one file.
+// Set by 'n' (also: Touch controller Y, left hand), cleared by whoever acts on it. Ignored
+// when there is only one file.
 bool TakeNextTrackRequest();
+void RequestNextTrack();
 
 // Seconds to jump the playback position by (negative = back), accumulated from 'h'/'l' and
 // controller thumbstick pushes since the last call. Cleared on read. 0 most of the time.
