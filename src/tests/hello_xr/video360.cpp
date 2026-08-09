@@ -387,7 +387,37 @@ struct Video360::Impl {
                 DrainDecoder(frame, swFrame, loopOffset, lastPts);
                 if (!loop) break;
                 avcodec_flush_buffers(dec);
-                loopOffset = lastPts + frameDuration;
+                // BUG (found 2026-08-09, see BUG_player_loop_speedup_2026-08-09.md in the
+                // stereo3d-pack repo): this used to be a plain assignment, `loopOffset =
+                // lastPts + frameDuration`. lastPts is always the file's own RAW, 0-based
+                // last timestamp (it naturally restarts near 0 every loop, since the file is
+                // re-read from position 0 each time) - so the assignment silently threw away
+                // every earlier loop's accumulated offset and reused the SAME one-loop-width
+                // value forever after the second loop. From loop 3 onward every loop's frames
+                // were queued under the identical pts window loop 2 used, which was already
+                // "in the past" relative to playbackTime by the time loop 2 finished - so the
+                // very next EOF/seek/flush cycle would fire almost immediately (its own
+                // frames were stale the instant they were queued), then the next one even
+                // faster, compounding into dozens of loop-restarts per real second. That is
+                // the sustained ~3x speed-up: not slow motion, but the file being re-decoded
+                // and re-discarded far faster than real time, over and over, in the same
+                // narrow pts window. Confirmed live via temporary instrumentation logging
+                // loopOffset/queue state at every EOF - it stayed pinned at one loop's width
+                // instead of growing, and loop-restart log lines went from ~7.5s apart to
+                // sub-second apart within a couple of loops. Must accumulate, not overwrite:
+                loopOffset += lastPts + frameDuration;
+                {
+                    // Secondary, smaller effect, worth keeping regardless of the fix above:
+                    // re-anchor playbackTime to whatever's next in the queue instead of
+                    // trusting the wall-clock accumulator across the loop seam. Without this,
+                    // any real time spent in this seek/flush (however small) is wall-clock
+                    // time AcquireCurrentSlot() still counts as elapsed but that produced no
+                    // frames. Unlike the manual-seek path above, the queue is NOT cleared here
+                    // - whatever's still queued is the tail end of the loop that just
+                    // finished, still correctly paced and still due to be shown.
+                    std::lock_guard<std::mutex> lock2(mutex);
+                    clockStarted = false;
+                }
                 if (av_seek_frame(fmt, streamIndex, 0, AVSEEK_FLAG_BACKWARD) < 0) {
                     Log::Write(Log::Level::Warning, "video360: seek to start failed, stopping playback");
                     break;
