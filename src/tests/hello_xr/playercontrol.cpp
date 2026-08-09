@@ -41,6 +41,13 @@ constexpr double kZoomStep = 1.15;  // multiplicative, per press/threshold-cross
 constexpr double kZoomMin = 0.5;
 constexpr double kZoomMax = 4.0;
 
+// Same bit-pattern/sentinel trick as g_zoomBits.
+std::atomic<int64_t> g_brightnessBits{0};
+
+constexpr double kBrightnessStep = 1.15;  // multiplicative, per button press
+constexpr double kBrightnessMin = 0.2;
+constexpr double kBrightnessMax = 3.0;
+
 // Milliseconds since steady_clock's epoch. 0 means "never" (SecondsSinceLastInteraction()
 // then returns a large number, which is what "never touched" should look like to the
 // progress-bar auto-hide timer).
@@ -143,6 +150,30 @@ void ZoomIn() { SetZoom(Zoom() * kZoomStep); }
 void ZoomOut() { SetZoom(Zoom() / kZoomStep); }
 void ResetZoom() { SetZoom(1.0); }
 
+double Brightness() {
+    const int64_t bits = g_brightnessBits.load();
+    if (bits == 0) return 1.0;
+    double b;
+    std::memcpy(&b, &bits, sizeof(b));
+    return b;
+}
+
+namespace {
+void SetBrightness(double b) {
+    if (b < kBrightnessMin) b = kBrightnessMin;
+    if (b > kBrightnessMax) b = kBrightnessMax;
+    int64_t bits;
+    std::memcpy(&bits, &b, sizeof(bits));
+    g_brightnessBits = bits;
+    TouchInteraction();
+    Log::Write(Log::Level::Info, Fmt("player: brillo %.2fx", b));
+}
+}  // namespace
+
+void BrightnessUp() { SetBrightness(Brightness() * kBrightnessStep); }
+void BrightnessDown() { SetBrightness(Brightness() / kBrightnessStep); }
+void ResetBrightness() { SetBrightness(1.0); }
+
 double SecondsSinceLastInteraction() {
     const int64_t last = g_lastInteractionMs.load();
     if (last == 0) return 1e9;  // never touched - "a long time ago" for the auto-hide timer
@@ -226,6 +257,17 @@ bool HandleKey(int c) {
         case '0':
             ResetZoom();
             return true;
+        case 'b':
+        case 'B':
+            BrightnessUp();
+            return true;
+        case 'd':
+        case 'D':
+            BrightnessDown();
+            return true;
+        case '9':
+            ResetBrightness();
+            return true;
         case '\r':
         case '\n':
             RequestRecenter();
@@ -275,9 +317,10 @@ void EndRawInput() {
 const char* HelpLine() {
     return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   h/l -10s/+10s   "
            "<-/-> (o < >) frame a frame   arriba/abajo (o ^ v) zoom   0 zoom normal   "
+           "b/d brillo   9 brillo normal   "
            "enter recentra   n siguiente   q salir "
            "(mando WMR: trigger pausa, stick X seek, stick Y zoom, grip recentra, "
-           "mantener Menu ~1.5s sale)";
+           "A/B (der.) brillo, mantener Menu ~1.5s sale)";
 }
 
 }  // namespace PlayerControl

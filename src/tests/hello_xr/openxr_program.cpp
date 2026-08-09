@@ -410,6 +410,12 @@ struct OpenXrProgram : IOpenXrProgram {
         // hand-cube visual), but graphicsplugin_vulkan.cpp's RenderView never actually draws
         // that cube - so the button was doing nothing in this player until now.
         XrAction recenterAction{XR_NULL_HANDLE};
+        // A/B click, oculus/touch_controller ONLY, right hand only - A/B don't exist on the
+        // left Touch controller (that's X/Y there) or on microsoft/motion_controller at all,
+        // and both sticks are already spoken for (seek, zoom), so these are the next free
+        // physical inputs. Brightness on the displayed content.
+        XrAction brightnessUpAction{XR_NULL_HANDLE};
+        XrAction brightnessDownAction{XR_NULL_HANDLE};
         std::array<XrPath, Side::COUNT> handSubactionPath;
         std::array<XrSpace, Side::COUNT> handSpace;
         std::array<float, Side::COUNT> handScale = {{1.0f, 1.0f}};
@@ -501,6 +507,22 @@ struct OpenXrProgram : IOpenXrProgram {
             actionInfo.countSubactionPaths = 0;
             actionInfo.subactionPaths = nullptr;
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.recenterAction));
+
+            // A/B click for brightness (see InputState::brightnessUpAction/DownAction) - right
+            // hand only, no subaction paths needed since there's only one valid source.
+            actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+            strcpy_s(actionInfo.actionName, "brightness_up");
+            strcpy_s(actionInfo.localizedActionName, "Brightness Up");
+            actionInfo.countSubactionPaths = 0;
+            actionInfo.subactionPaths = nullptr;
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.brightnessUpAction));
+
+            actionInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+            strcpy_s(actionInfo.actionName, "brightness_down");
+            strcpy_s(actionInfo.localizedActionName, "Brightness Down");
+            actionInfo.countSubactionPaths = 0;
+            actionInfo.subactionPaths = nullptr;
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.brightnessDownAction));
         }
 
         std::array<XrPath, Side::COUNT> selectPath;
@@ -511,6 +533,7 @@ struct OpenXrProgram : IOpenXrProgram {
         std::array<XrPath, Side::COUNT> hapticPath;
         std::array<XrPath, Side::COUNT> menuClickPath;
         std::array<XrPath, Side::COUNT> bClickPath;
+        std::array<XrPath, Side::COUNT> aClickPath;
         std::array<XrPath, Side::COUNT> triggerValuePath;
         std::array<XrPath, Side::COUNT> thumbstickXPath;
         std::array<XrPath, Side::COUNT> thumbstickYPath;
@@ -530,6 +553,9 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/menu/click", &menuClickPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/b/click", &bClickPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/b/click", &bClickPath[Side::RIGHT]));
+        // a/click only exists on the right hand on any profile in this file (Touch's left
+        // controller has x/y, not a/b) - not bothering to resolve the left path at all.
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/a/click", &aClickPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/trigger/value", &triggerValuePath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/trigger/value", &triggerValuePath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick/x", &thumbstickXPath[Side::LEFT]));
@@ -581,7 +607,9 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.pauseAction, triggerValuePath[Side::LEFT]},
                                                             {m_input.pauseAction, triggerValuePath[Side::RIGHT]},
                                                             {m_input.recenterAction, squeezeValuePath[Side::LEFT]},
-                                                            {m_input.recenterAction, squeezeValuePath[Side::RIGHT]}}};
+                                                            {m_input.recenterAction, squeezeValuePath[Side::RIGHT]},
+                                                            {m_input.brightnessUpAction, aClickPath[Side::RIGHT]},
+                                                            {m_input.brightnessDownAction, bClickPath[Side::RIGHT]}}};
             XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
             suggestedBindings.interactionProfile = oculusTouchInteractionProfilePath;
             suggestedBindings.suggestedBindings = bindings.data();
@@ -918,6 +946,8 @@ struct OpenXrProgram : IOpenXrProgram {
                     LogActionSourceName(m_input.zoomAction, "Zoom");
                     LogActionSourceName(m_input.pauseAction, "Pause");
                     LogActionSourceName(m_input.recenterAction, "Recenter");
+                    LogActionSourceName(m_input.brightnessUpAction, "BrightnessUp");
+                    LogActionSourceName(m_input.brightnessDownAction, "BrightnessDown");
                     break;
                 case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
                 default: {
@@ -1145,6 +1175,26 @@ struct OpenXrProgram : IOpenXrProgram {
         if ((recenterValue.isActive == XR_TRUE) && (recenterValue.changedSinceLastSync == XR_TRUE) &&
             (recenterValue.currentState == XR_TRUE)) {
             PlayerControl::RequestRecenter();
+        }
+
+        // Brightness: A/B on the right Touch controller, edge-triggered like recenter (fires
+        // once per press, not repeatedly while held).
+        XrActionStateGetInfo brightUpGetInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.brightnessUpAction,
+                                             XR_NULL_PATH};
+        XrActionStateBoolean brightUpValue{XR_TYPE_ACTION_STATE_BOOLEAN};
+        CHECK_XRCMD(xrGetActionStateBoolean(m_session, &brightUpGetInfo, &brightUpValue));
+        if ((brightUpValue.isActive == XR_TRUE) && (brightUpValue.changedSinceLastSync == XR_TRUE) &&
+            (brightUpValue.currentState == XR_TRUE)) {
+            PlayerControl::BrightnessUp();
+        }
+
+        XrActionStateGetInfo brightDownGetInfo{XR_TYPE_ACTION_STATE_GET_INFO, nullptr, m_input.brightnessDownAction,
+                                               XR_NULL_PATH};
+        XrActionStateBoolean brightDownValue{XR_TYPE_ACTION_STATE_BOOLEAN};
+        CHECK_XRCMD(xrGetActionStateBoolean(m_session, &brightDownGetInfo, &brightDownValue));
+        if ((brightDownValue.isActive == XR_TRUE) && (brightDownValue.changedSinceLastSync == XR_TRUE) &&
+            (brightDownValue.currentState == XR_TRUE)) {
+            PlayerControl::BrightnessDown();
         }
     }
 

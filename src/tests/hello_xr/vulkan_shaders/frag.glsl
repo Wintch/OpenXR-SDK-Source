@@ -108,6 +108,10 @@ void main()
 
     FragColor = vec4(inside > 0.5 ? textureGrad(equirectTex, uv, dx, dy).rgb : vec3(0.0), 1.0);
 
+    // Brightness: a plain multiplier on the content, applied before the overlay bars below so
+    // dimming the video never also dims the progress/quit-hold feedback.
+    FragColor.rgb *= ubuf.panoFov.w;
+
     // Progress bar: a thin strip near the bottom of the screen, drawn straight in screen
     // space (not projected onto the pano), so it stays flat and legible no matter what
     // projection mode is active or what direction you're looking. mode.y/mode.z aren't used

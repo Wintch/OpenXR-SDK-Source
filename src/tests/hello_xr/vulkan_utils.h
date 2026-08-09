@@ -942,6 +942,7 @@ struct VulkanUniformBuffer {
     XrColor4f tintColor;      // fov tangents: left, right, up, down
     float uvScaleOffset[4];   // this eye's sub-rectangle of a stereo frame
     float panoFov[4];         // xy: 180 half-angles (rad) / flat half-extents. z: zoom (1=off).
+                               // w: brightness multiplier (1=off).
     int32_t mode[4];          // x: 0 = 360 equirect, 1 = 180 half-equirect, 2 = flat screen
 };
 

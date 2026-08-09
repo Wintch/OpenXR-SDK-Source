@@ -13,6 +13,8 @@
 //   up down zoom in / out (also: WMR controller thumbstick Y; ^ v as a plain-key fallback,
 //           same idea as < > for the arrow keys above)
 //   0       back to no zoom (1x)
+//   b  d    brighter / dimmer (also: Touch controller A/B, right hand)
+//   9       back to normal brightness (1x)
 //   enter   recenter forward (also: WMR controller squeeze/grip)
 //   n       next file in the playlist
 //   q ESC   quit (also: hold the WMR Menu button ~1.5s)
@@ -75,6 +77,14 @@ double Zoom();
 void ZoomIn();
 void ZoomOut();
 void ResetZoom();
+
+// Brightness multiplier on the final displayed color: >1 brighter, <1 dimmer, 1.0 is
+// native/off. Driven by the Touch controller's A/B buttons (right hand only - the sticks are
+// already spoken for by seek and zoom) and by b/d on the keyboard.
+double Brightness();
+void BrightnessUp();
+void BrightnessDown();
+void ResetBrightness();
 
 // Recenter: squeeze/grip (either hand) resets "forward" to wherever you're currently facing,
 // same idea as the recenter button most 360 video players have. Requested by the input-poll

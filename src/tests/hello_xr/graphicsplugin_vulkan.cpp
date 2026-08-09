@@ -1811,9 +1811,11 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         PanoEyeUvTransform(m_panoLayout, eye, &pushConstants.uvScaleOffset[0], &pushConstants.uvScaleOffset[2]);
         pushConstants.panoFov[0] = m_panoLayout.halfFovX;
         pushConstants.panoFov[1] = m_panoLayout.halfFovY;
-        // panoFov.z was unused (see frag.glsl) - reusing it for digital zoom instead of growing
-        // the push-constant struct, same reasoning as mode.y/mode.z for the progress bar.
+        // panoFov.z/.w were unused (see frag.glsl) - reusing them for zoom and brightness
+        // instead of growing the push-constant struct, same reasoning as mode.y/mode.z for
+        // the progress bar.
         pushConstants.panoFov[2] = (float)PlayerControl::Zoom();
+        pushConstants.panoFov[3] = (float)PlayerControl::Brightness();
         pushConstants.mode[0] = (m_panoLayout.projection == PanoProjection::HalfEquirect180)   ? 1
                                 : (m_panoLayout.projection == PanoProjection::Flat)           ? 2
                                                                                               : 0;
