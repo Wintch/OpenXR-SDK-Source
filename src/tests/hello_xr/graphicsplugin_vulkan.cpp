@@ -1205,33 +1205,27 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         if (m_photoImageMemory) { vkFreeMemory(m_vkDevice, m_photoImageMemory, nullptr); m_photoImageMemory = VK_NULL_HANDLE; }
     }
 
-    // Moves to the next file in the playlist, rebuilding everything for its geometry. A file
-    // that will not open is skipped rather than fatal - one bad download should not end
-    // playback - but if none of them open we give up and leave the last good frame on screen.
-    void AdvanceTrack() {
-        const size_t count = m_playlist.size();
-        for (size_t attempt = 0; attempt < count; attempt++) {
+    // Moves |delta| steps through the playlist (negative = backward), rebuilding everything
+    // for the new file's geometry. Replaces the old single-step AdvanceTrack()/
+    // PreviousTrack() pair (2026-08-09): next/prev requests are now COUNTED, not latched
+    // (see playercontrol.h), and coalesced here into one jump - N rapid presses cost one
+    // destroy/reopen hitch instead of N sequential ones, which is also what made rapid
+    // pressing feel broken before (each press paid the full vkDeviceWaitIdle + realloc
+    // hitch, and presses landing inside a hitch were swallowed entirely). A file that will
+    // not open is skipped forward one at a time rather than fatal; if nothing opens we give
+    // up and leave the last good frame on screen.
+    void AdvanceTrackBy(long delta) {
+        const long count = (long)m_playlist.size();
+        long step = ((delta % count) + count) % count;  // normalize, negatives included
+        if (step == 0) return;  // net-zero movement (incl. full wraps) - nothing to do
+        for (long attempt = 0; attempt < count; attempt++) {
             DestroyVideoResources();
             m_videoMode = false;
-            m_playlistIndex = (m_playlistIndex + 1) % count;
-            Log::Write(Log::Level::Info, Fmt("playlist: %zu/%zu", m_playlistIndex + 1, count));
+            m_playlistIndex = (m_playlistIndex + (size_t)step) % (size_t)count;
+            Log::Write(Log::Level::Info, Fmt("playlist: %zu/%zu", m_playlistIndex + 1, (size_t)count));
             if (OpenVideoTexture(m_playlist[m_playlistIndex])) return;
             Log::Write(Log::Level::Warning, Fmt("playlist: skipping '%s'", m_playlist[m_playlistIndex].c_str()));
-        }
-        Log::Write(Log::Level::Error, "playlist: no file in the list could be opened, stopping playback");
-    }
-
-    // Mirror of AdvanceTrack(), other direction. `count - 1` instead of `-1` because
-    // m_playlistIndex is unsigned - going below 0 would wrap to a huge number, not -1.
-    void PreviousTrack() {
-        const size_t count = m_playlist.size();
-        for (size_t attempt = 0; attempt < count; attempt++) {
-            DestroyVideoResources();
-            m_videoMode = false;
-            m_playlistIndex = (m_playlistIndex + count - 1) % count;
-            Log::Write(Log::Level::Info, Fmt("playlist: %zu/%zu", m_playlistIndex + 1, count));
-            if (OpenVideoTexture(m_playlist[m_playlistIndex])) return;
-            Log::Write(Log::Level::Warning, Fmt("playlist: skipping '%s'", m_playlist[m_playlistIndex].c_str()));
+            step = 1;  // after a bad file, walk forward one at a time
         }
         Log::Write(Log::Level::Error, "playlist: no file in the list could be opened, stopping playback");
     }
@@ -1691,12 +1685,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             if (frameStep != 0 && m_video->FrameRate() > 0.0) {
                 m_video->Seek(frameStep / m_video->FrameRate());
             }
-            const bool skip = PlayerControl::TakeNextTrackRequest() && m_playlist.size() > 1;
-            const bool back = PlayerControl::TakePreviousTrackRequest() && m_playlist.size() > 1;
-            if (back) {
-                PreviousTrack();
-            } else if (skip || (m_playlist.size() > 1 && m_video->Finished())) {
-                AdvanceTrack();
+            // Net movement: accumulated next-presses minus prev-presses since the last
+            // frame, coalesced into one jump (see AdvanceTrackBy). Counters are drained
+            // even for single-file playback so stale presses can't fire later.
+            const long fwd = PlayerControl::TakeNextTrackRequest();
+            const long bwd = PlayerControl::TakePreviousTrackRequest();
+            if (m_playlist.size() > 1) {
+                long delta = fwd - bwd;
+                if (delta == 0 && m_video->Finished()) delta = 1;
+                if (delta != 0) AdvanceTrackBy(delta);
             }
             if (m_videoMode) UpdateVideoTexture();
         }

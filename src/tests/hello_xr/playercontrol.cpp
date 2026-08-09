@@ -22,8 +22,13 @@ constexpr int kNormalRateIndex = 3;
 
 std::atomic<int> g_rateIndex{kNormalRateIndex};
 std::atomic<bool> g_paused{false};
-std::atomic<bool> g_nextTrack{false};
-std::atomic<bool> g_prevTrack{false};
+// Counters, not bools (changed 2026-08-09): with a bool, N quick presses before the render
+// thread consumed the flag collapsed into ONE track advance - user report: pressing next
+// repeatedly "arranca de nuevo del mismo punto" until waiting a few seconds between
+// presses. Counting lets rapid presses accumulate, and the consumer coalesces them into a
+// single N-position jump with one destroy/reopen hitch instead of N sequential ones.
+std::atomic<int> g_nextTrack{0};
+std::atomic<int> g_prevTrack{0};
 std::atomic<bool> g_quit{false};
 std::atomic<int> g_seekJumpSeconds{0};
 std::atomic<int> g_frameStepRequest{0};
@@ -121,19 +126,19 @@ void NormalSpeed() {
     ReportRate();
 }
 
-bool TakeNextTrackRequest() { return g_nextTrack.exchange(false); }
+int TakeNextTrackRequest() { return g_nextTrack.exchange(0); }
 
 void RequestNextTrack() {
-    g_nextTrack = true;
+    g_nextTrack += 1;
     TouchInteraction();
     MaybeQuitOnAnyKey();
     Log::Write(Log::Level::Info, "player: siguiente");
 }
 
-bool TakePreviousTrackRequest() { return g_prevTrack.exchange(false); }
+int TakePreviousTrackRequest() { return g_prevTrack.exchange(0); }
 
 void RequestPreviousTrack() {
-    g_prevTrack = true;
+    g_prevTrack += 1;
     TouchInteraction();
     MaybeQuitOnAnyKey();
     Log::Write(Log::Level::Info, "player: anterior");

@@ -34,13 +34,15 @@ void Faster();
 void NormalSpeed();
 bool IsPaused();
 
-// Set by 'n' (also: Touch controller Y, left hand), cleared by whoever acts on it. Ignored
-// when there is only one file.
-bool TakeNextTrackRequest();
+// Accumulated next-track presses since last read ('n', also: Touch controller Y, left
+// hand), cleared on read. A COUNT, not a flag (2026-08-09): rapid presses used to collapse
+// into one advance; now the consumer coalesces N presses into a single N-position jump.
+// Ignored when there is only one file.
+int TakeNextTrackRequest();
 void RequestNextTrack();
 
 // Same shape, other direction: 'p' (also: Touch controller X, left hand).
-bool TakePreviousTrackRequest();
+int TakePreviousTrackRequest();
 void RequestPreviousTrack();
 
 // Seconds to jump the playback position by (negative = back), accumulated from 'h'/'l' and
