@@ -1819,6 +1819,9 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         pushConstants.mode[0] = (m_panoLayout.projection == PanoProjection::HalfEquirect180)   ? 1
                                 : (m_panoLayout.projection == PanoProjection::Flat)           ? 2
                                                                                               : 0;
+        // Bit 0x10 alongside PROJ_* in the low nibble: which eye this is, for frag.glsl's
+        // overlay-bar parallax (see there). Spare bits in an int that only ever needed 0/1/2.
+        if (eye == 1) pushConstants.mode[0] |= 0x10;
         // Progress bar (see frag.glsl): mode.y is fill fraction *1000, mode.z is visibility
         // alpha *255. Only shown for a few seconds after the last transport-control touch, so
         // it doesn't sit on screen the whole time someone is just watching.
