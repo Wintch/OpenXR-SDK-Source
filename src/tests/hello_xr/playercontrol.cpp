@@ -32,6 +32,15 @@ std::atomic<bool> g_recenterRequested{false};
 // guaranteed lock-free on every platform this builds for; this is - matches g_lastInteractionMs.
 std::atomic<int64_t> g_recenterYawBits{0};
 
+// Same bit-pattern trick, and the same "0 means unset" sentinel g_lastInteractionMs uses - the
+// bit pattern of 1.0 is not all-zero, so a freshly-started process (bits == 0) correctly reads
+// as "no zoom" without needing a non-constexpr initializer to store 1.0's bits up front.
+std::atomic<int64_t> g_zoomBits{0};
+
+constexpr double kZoomStep = 1.15;  // multiplicative, per press/threshold-cross
+constexpr double kZoomMin = 0.5;
+constexpr double kZoomMax = 4.0;
+
 // Milliseconds since steady_clock's epoch. 0 means "never" (SecondsSinceLastInteraction()
 // then returns a large number, which is what "never touched" should look like to the
 // progress-bar auto-hide timer).
@@ -110,6 +119,30 @@ void StepFrame(int frames) {
     Log::Write(Log::Level::Info, Fmt("player: frame %+d", frames));
 }
 
+double Zoom() {
+    const int64_t bits = g_zoomBits.load();
+    if (bits == 0) return 1.0;
+    double z;
+    std::memcpy(&z, &bits, sizeof(z));
+    return z;
+}
+
+namespace {
+void SetZoom(double z) {
+    if (z < kZoomMin) z = kZoomMin;
+    if (z > kZoomMax) z = kZoomMax;
+    int64_t bits;
+    std::memcpy(&bits, &z, sizeof(bits));
+    g_zoomBits = bits;
+    TouchInteraction();
+    Log::Write(Log::Level::Info, Fmt("player: zoom %.2fx", z));
+}
+}  // namespace
+
+void ZoomIn() { SetZoom(Zoom() * kZoomStep); }
+void ZoomOut() { SetZoom(Zoom() / kZoomStep); }
+void ResetZoom() { SetZoom(1.0); }
+
 double SecondsSinceLastInteraction() {
     const int64_t last = g_lastInteractionMs.load();
     if (last == 0) return 1e9;  // never touched - "a long time ago" for the auto-hide timer
@@ -183,6 +216,16 @@ bool HandleKey(int c) {
         case '>':
             StepFrame(1);
             return true;
+        case '^':
+            ZoomIn();
+            return true;
+        case 'v':
+        case 'V':
+            ZoomOut();
+            return true;
+        case '0':
+            ResetZoom();
+            return true;
         case '\r':
         case '\n':
             RequestRecenter();
@@ -231,9 +274,10 @@ void EndRawInput() {
 
 const char* HelpLine() {
     return "  Teclas: [espacio] pausa   [ ] velocidad   1 normal   h/l -10s/+10s   "
-           "<-/-> (o < >) frame a frame   enter recentra   "
-           "n siguiente   q salir "
-           "(mando WMR: trigger pausa, stick seek, grip recentra, mantener Menu ~1.5s sale)";
+           "<-/-> (o < >) frame a frame   arriba/abajo (o ^ v) zoom   0 zoom normal   "
+           "enter recentra   n siguiente   q salir "
+           "(mando WMR: trigger pausa, stick X seek, stick Y zoom, grip recentra, "
+           "mantener Menu ~1.5s sale)";
 }
 
 }  // namespace PlayerControl

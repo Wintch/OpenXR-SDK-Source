@@ -316,13 +316,14 @@ int main(int argc, char* argv[]) {
             while (!quitKeyPressed) {
                 const int c = getchar();
 #if defined(XR_OS_LINUX) || defined(XR_OS_APPLE)
-                // Arrow keys arrive as the 3-byte escape sequence ESC '[' C/D. ESC alone is
+                // Arrow keys arrive as the 3-byte escape sequence ESC '[' A/B/C/D. ESC alone is
                 // also the quit key, so on ESC we peek for more bytes with a short poll()
                 // timeout instead of assuming: a real Escape keypress has nothing following
                 // it, while an arrow key's remaining bytes are already sitting in the
                 // terminal's input buffer by the time we get here (the pty writes all three
-                // as one burst). Left/right also has plain '<'/'>' as a keyboard-only
-                // fallback in HandleKey, in case a given terminal encodes arrows differently.
+                // as one burst). Left/right and up/down also have plain '<'/'>' and '^'/'v' as
+                // a keyboard-only fallback in HandleKey, in case a terminal encodes arrows
+                // differently.
                 if (c == 27 && isatty(STDIN_FILENO)) {
                     pollfd pfd{STDIN_FILENO, POLLIN, 0};
                     if (poll(&pfd, 1, 30) > 0) {
@@ -335,9 +336,13 @@ int main(int argc, char* argv[]) {
                                     PlayerControl::StepFrame(1);
                                 } else if (c3 == 'D') {
                                     PlayerControl::StepFrame(-1);
+                                } else if (c3 == 'A') {
+                                    PlayerControl::ZoomIn();
+                                } else if (c3 == 'B') {
+                                    PlayerControl::ZoomOut();
                                 }
-                                // any other CSI sequence (up/down, Home/End, F-keys...): not
-                                // handled, just swallowed along with its introducer bytes.
+                                // any other CSI sequence (Home/End, F-keys...): not handled,
+                                // just swallowed along with its introducer bytes.
                             }
                             continue;
                         }

@@ -7,9 +7,12 @@
 //   space   pause / resume (also: WMR controller trigger)
 //   [  ]    slower / faster (1x, 0.5x, 0.25x, 2x ...)
 //   1       back to normal speed
-//   h  l    seek -10s / +10s (also: WMR controller thumbstick)
+//   h  l    seek -10s / +10s (also: WMR controller thumbstick X)
 //   <- ->   step back / forward one frame (also: < >). Pauses first - the jump is a single
 //           frame, too small to see while still playing.
+//   up down zoom in / out (also: WMR controller thumbstick Y; ^ v as a plain-key fallback,
+//           same idea as < > for the arrow keys above)
+//   0       back to no zoom (1x)
 //   enter   recenter forward (also: WMR controller squeeze/grip)
 //   n       next file in the playlist
 //   q ESC   quit (also: hold the WMR Menu button ~1.5s)
@@ -63,6 +66,15 @@ bool QuitRequested();
 // hold indicator. 0 when Menu isn't held or the hold was released early.
 void SetQuitHoldFraction(double frac);
 int QuitHoldPermille();
+
+// Digital zoom on the panoramic/flat content: >1 magnifies (a narrower slice of the source
+// fills the view), <1 shows more of it (mild fisheye-like widening past the native FOV).
+// 1.0 is native/off. Driven by the controller thumbstick Y (the vertical axis is otherwise
+// unused - QueueSeek already owns X) and by Up/Down (or ^/v as a keyboard fallback).
+double Zoom();
+void ZoomIn();
+void ZoomOut();
+void ResetZoom();
 
 // Recenter: squeeze/grip (either hand) resets "forward" to wherever you're currently facing,
 // same idea as the recenter button most 360 video players have. Requested by the input-poll

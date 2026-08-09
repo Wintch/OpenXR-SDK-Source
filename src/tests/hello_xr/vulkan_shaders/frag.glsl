@@ -42,16 +42,24 @@ void main()
     float inside = 1.0;
     bool wraps = false;
 
+    // Digital zoom (panoFov.z - see vulkan_utils.h, unused before this): >1 magnifies, <1
+    // shows more of the source than the headset's native FOV would. Applied as a divisor on
+    // whatever angular/screen coordinate each branch below maps into uv - the sphere or
+    // screen itself never changes, just how much of it one physical ray picks up. Floored well
+    // above 0 so a runaway zoom-out can't divide by (near-)zero.
+    float zoom = max(ubuf.panoFov.z, 0.01);
+
     if (ubuf.mode.x == PROJ_FLAT) {
         // A virtual screen floating straight ahead. Rays going sideways or backwards miss it.
         float depth = -dir.z;
         vec2 screen = dir.xy / max(depth, 1e-4);
+        screen /= zoom;
         uv = screen / vec2(ubuf.panoFov.x, -ubuf.panoFov.y) * 0.5 + 0.5;
         inside = (depth > 0.0 && all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) ? 1.0 : 0.0;
     } else {
         // Equirectangular: horizontal angle -> u, vertical angle -> v.
-        float az = atan(dir.x, -dir.z);            // 0 straight ahead, +/-PI behind
-        float el = asin(clamp(dir.y, -1.0, 1.0));  // +PI/2 straight up
+        float az = atan(dir.x, -dir.z) / zoom;            // 0 straight ahead, +/-PI behind
+        float el = asin(clamp(dir.y, -1.0, 1.0)) / zoom;  // +PI/2 straight up
 
         if (ubuf.mode.x == PROJ_180) {
             // The frame only holds the hemisphere in front of you; everything else stays black

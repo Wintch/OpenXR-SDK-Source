@@ -393,13 +393,17 @@ struct OpenXrProgram : IOpenXrProgram {
         XrAction poseAction{XR_NULL_HANDLE};
         XrAction vibrateAction{XR_NULL_HANDLE};
         XrAction quitAction{XR_NULL_HANDLE};
-        // Thumbstick X axis, WMR motion controller only (see the binding block below) - used
-        // to seek the 360/VR180 video player. Not bound on other profiles: we only have a WMR
-        // controller to test with, and guessing paths for profiles we cannot verify is how
+        // Thumbstick X axis - seeks the 360/VR180 video player. Only bound on
+        // oculus/touch_controller (what the G2 actually presents, see docs/03-controllers.md)
+        // and microsoft/motion_controller: those are the two profiles bound by hand against
+        // real hardware, and guessing paths for profiles we cannot verify is how
         // silently-wrong bindings happen.
         XrAction seekAction{XR_NULL_HANDLE};
-        // Trigger value, WMR motion controller only - toggles video pause. Same rationale as
-        // seekAction: only bound on the one profile we have real hardware to verify against.
+        // Thumbstick Y axis, same two profiles and same rationale as seekAction - the vertical
+        // axis was otherwise unused, so it drives digital zoom instead of adding a new button.
+        XrAction zoomAction{XR_NULL_HANDLE};
+        // Trigger value, same two profiles - toggles video pause. Same rationale as
+        // seekAction: only bound on profiles we have real hardware to verify against.
         XrAction pauseAction{XR_NULL_HANDLE};
         // Squeeze/grip click, WMR motion controller only - recenters forward. grabAction is
         // also bound to this same physical button (from the original hello_xr sample, scales a
@@ -463,7 +467,7 @@ struct OpenXrProgram : IOpenXrProgram {
             actionInfo.subactionPaths = nullptr;
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.quitAction));
 
-            // Thumbstick X for video seek (WMR only, see InputState::seekAction).
+            // Thumbstick X for video seek (see InputState::seekAction).
             actionInfo.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
             strcpy_s(actionInfo.actionName, "seek_video");
             strcpy_s(actionInfo.localizedActionName, "Seek Video");
@@ -471,7 +475,15 @@ struct OpenXrProgram : IOpenXrProgram {
             actionInfo.subactionPaths = m_input.handSubactionPath.data();
             CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.seekAction));
 
-            // Trigger for video pause/resume (WMR only, see InputState::pauseAction) - a quick
+            // Thumbstick Y for video zoom (see InputState::zoomAction).
+            actionInfo.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+            strcpy_s(actionInfo.actionName, "zoom_video");
+            strcpy_s(actionInfo.localizedActionName, "Zoom Video");
+            actionInfo.countSubactionPaths = uint32_t(m_input.handSubactionPath.size());
+            actionInfo.subactionPaths = m_input.handSubactionPath.data();
+            CHECK_XRCMD(xrCreateAction(m_input.actionSet, &actionInfo, &m_input.zoomAction));
+
+            // Trigger for video pause/resume (see InputState::pauseAction) - a quick
             // debug-friendly toggle so playback state can be flipped without reaching for the
             // keyboard.
             actionInfo.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
@@ -501,6 +513,7 @@ struct OpenXrProgram : IOpenXrProgram {
         std::array<XrPath, Side::COUNT> bClickPath;
         std::array<XrPath, Side::COUNT> triggerValuePath;
         std::array<XrPath, Side::COUNT> thumbstickXPath;
+        std::array<XrPath, Side::COUNT> thumbstickYPath;
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/select/click", &selectPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/select/click", &selectPath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/squeeze/value", &squeezeValuePath[Side::LEFT]));
@@ -521,6 +534,8 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/trigger/value", &triggerValuePath[Side::RIGHT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick/x", &thumbstickXPath[Side::LEFT]));
         CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/thumbstick/x", &thumbstickXPath[Side::RIGHT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/left/input/thumbstick/y", &thumbstickYPath[Side::LEFT]));
+        CHECK_XRCMD(xrStringToPath(m_instance, "/user/hand/right/input/thumbstick/y", &thumbstickYPath[Side::RIGHT]));
         // Suggest bindings for KHR Simple.
         {
             XrPath khrSimpleInteractionProfilePath;
@@ -561,6 +576,8 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.vibrateAction, hapticPath[Side::RIGHT]},
                                                             {m_input.seekAction, thumbstickXPath[Side::LEFT]},
                                                             {m_input.seekAction, thumbstickXPath[Side::RIGHT]},
+                                                            {m_input.zoomAction, thumbstickYPath[Side::LEFT]},
+                                                            {m_input.zoomAction, thumbstickYPath[Side::RIGHT]},
                                                             {m_input.pauseAction, triggerValuePath[Side::LEFT]},
                                                             {m_input.pauseAction, triggerValuePath[Side::RIGHT]},
                                                             {m_input.recenterAction, squeezeValuePath[Side::LEFT]},
@@ -626,6 +643,8 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.vibrateAction, hapticPath[Side::RIGHT]},
                                                             {m_input.seekAction, thumbstickXPath[Side::LEFT]},
                                                             {m_input.seekAction, thumbstickXPath[Side::RIGHT]},
+                                                            {m_input.zoomAction, thumbstickYPath[Side::LEFT]},
+                                                            {m_input.zoomAction, thumbstickYPath[Side::RIGHT]},
                                                             {m_input.pauseAction, triggerValuePath[Side::LEFT]},
                                                             {m_input.pauseAction, triggerValuePath[Side::RIGHT]},
                                                             {m_input.recenterAction, squeezeClickPath[Side::LEFT]},
@@ -896,6 +915,7 @@ struct OpenXrProgram : IOpenXrProgram {
                     LogActionSourceName(m_input.poseAction, "Pose");
                     LogActionSourceName(m_input.vibrateAction, "Vibrate");
                     LogActionSourceName(m_input.seekAction, "Seek");
+                    LogActionSourceName(m_input.zoomAction, "Zoom");
                     LogActionSourceName(m_input.pauseAction, "Pause");
                     LogActionSourceName(m_input.recenterAction, "Recenter");
                     break;
@@ -1048,6 +1068,29 @@ struct OpenXrProgram : IOpenXrProgram {
                     seekLatched[hand] = true;
                 } else if (seekLatched[hand] && std::fabs(v) < 0.3f) {
                     seekLatched[hand] = false;
+                }
+            }
+
+            // Video zoom: thumbstick push up/down steps zoom in/out. Same hysteresis-latch
+            // shape as seek, on the vertical axis seek doesn't use. Sign assumed from the
+            // usual OpenXR/gamepad convention (+y = stick pushed up = zoom in) - not yet
+            // confirmed with the headset on; if it comes out backwards on a live test, flip
+            // the ZoomIn()/ZoomOut() branches below, not the sign of v itself.
+            static std::array<bool, Side::COUNT> zoomLatched{{false, false}};
+            getInfo.action = m_input.zoomAction;
+            XrActionStateFloat zoomValue{XR_TYPE_ACTION_STATE_FLOAT};
+            CHECK_XRCMD(xrGetActionStateFloat(m_session, &getInfo, &zoomValue));
+            if (zoomValue.isActive == XR_TRUE) {
+                const float v = zoomValue.currentState;
+                if (!zoomLatched[hand] && std::fabs(v) > 0.7f) {
+                    if (v > 0.0f) {
+                        PlayerControl::ZoomIn();
+                    } else {
+                        PlayerControl::ZoomOut();
+                    }
+                    zoomLatched[hand] = true;
+                } else if (zoomLatched[hand] && std::fabs(v) < 0.3f) {
+                    zoomLatched[hand] = false;
                 }
             }
 
