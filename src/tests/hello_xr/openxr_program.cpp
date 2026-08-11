@@ -738,6 +738,43 @@ struct OpenXrProgram : IOpenXrProgram {
         CHECK_XRCMD(xrAttachSessionActionSets(m_session, &attachInfo));
     }
 
+
+    /*!
+     * Push a three-axis gizmo for a tracked pose instead of a single cube.
+     *
+     * A cube is symmetric, so it shows position but says nothing about which way the device is
+     * pointing -- useless for checking whether an orientation is right, and easy to misread once
+     * positional tracking starts moving things around. Three thin bars, one per axis, make the
+     * frame unambiguous: X to the device's right, Y up, Z backward (OpenXR's -Z is forward, so
+     * the Z bar points back out of the muzzle).
+     *
+     * Bars are offset by half their length along their own axis so they meet at the pose origin
+     * rather than straddling it, which keeps the origin itself readable as the point where the
+     * three meet. Colours come from the cube mesh's own per-face vertex colours, so the three are
+     * told apart by direction rather than by hue.
+     */
+    static void PushPoseGizmo(std::vector<Cube>& cubes, const XrPosef& pose, float scale) {
+        constexpr float kLength = 0.12f;
+        constexpr float kThick = 0.012f;
+        const float len = kLength * scale;
+        const float thick = kThick * scale;
+
+        const XrVector3f axes[3] = {{len * 0.5f, 0.f, 0.f}, {0.f, len * 0.5f, 0.f}, {0.f, 0.f, len * 0.5f}};
+        const XrVector3f sizes[3] = {{len, thick, thick}, {thick, len, thick}, {thick, thick, len}};
+
+        for (int axis = 0; axis < 3; axis++) {
+            XrVector3f offset;
+            XrQuaternionf_RotateVector3f(&offset, &pose.orientation, &axes[axis]);
+
+            XrPosef barPose = pose;
+            barPose.position.x += offset.x;
+            barPose.position.y += offset.y;
+            barPose.position.z += offset.z;
+
+            cubes.push_back(Cube{barPose, sizes[axis]});
+        }
+    }
+
     void CreateVisualizedSpaces() {
         CHECK(m_session != XR_NULL_HANDLE);
 
@@ -1373,8 +1410,7 @@ struct OpenXrProgram : IOpenXrProgram {
             if (XR_UNQUALIFIED_SUCCESS(res)) {
                 if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
                     (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
-                    float scale = 0.1f * m_input.handScale[hand];
-                    cubes.push_back(Cube{spaceLocation.pose, {scale, scale, scale}});
+                    PushPoseGizmo(cubes, spaceLocation.pose, m_input.handScale[hand]);
                 }
             } else {
                 // Tracking loss is expected when the hand is not active so only log a message
