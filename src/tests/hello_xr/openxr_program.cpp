@@ -1336,7 +1336,15 @@ struct OpenXrProgram : IOpenXrProgram {
         // For each locatable space that we want to visualize, render a 25cm cube.
         std::vector<Cube> cubes;
 
-        for (XrSpace visualizedSpace : m_visualizedSpaces) {
+        // Reference-space cubes (ViewFront, Local, Stage, ...) are OFF by default; set
+        // HELLO_XR_SPACE_CUBES=1 to get the original sample's behaviour back.
+        //
+        // In a 3dof session the head sits exactly at the Local origin, so the Local cube lands
+        // centred on the viewer's face -- and since the pipeline draws with cullMode NONE, its
+        // inner faces render too and the viewer ends up sealed inside an opaque box that hides
+        // everything else, controller cubes included. Found the hard way: "estoy dentro de un
+        // cubo de colores, no veo los controles".
+        for (XrSpace visualizedSpace : (m_spaceCubesEnabled ? m_visualizedSpaces : std::vector<XrSpace>{})) {
             XrSpaceLocation spaceLocation{XR_TYPE_SPACE_LOCATION};
             res = xrLocateSpace(visualizedSpace, m_appSpace, predictedDisplayTime, &spaceLocation);
             CHECK_XRRESULT(res, "xrLocateSpace");
@@ -1510,6 +1518,12 @@ struct OpenXrProgram : IOpenXrProgram {
     int64_t m_depthSwapchainFormat{-1};
 
     std::vector<XrSpace> m_visualizedSpaces;
+
+    //! See the loop that reads this. Opt-in: HELLO_XR_SPACE_CUBES=1.
+    const bool m_spaceCubesEnabled{[] {
+        const char* v = std::getenv("HELLO_XR_SPACE_CUBES");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }()};
 
     // Application's current lifecycle state according to the runtime
     XrSessionState m_sessionState{XR_SESSION_STATE_UNKNOWN};

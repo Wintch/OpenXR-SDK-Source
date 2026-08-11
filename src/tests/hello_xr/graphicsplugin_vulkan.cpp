@@ -347,16 +347,21 @@ struct VulkanArraySliceState {
     std::vector<RenderTarget> m_renderTarget;  // per swapchain index
     RenderPass m_rp{};
     Pipeline m_pipe{};
+    Pipeline m_pipeCube{};
     Pipeline m_pipeCompute{};
 
     void init(const VulkanDebugObjectNamer& namer, VkDevice device, uint32_t capacity, const VkExtent2D size, VkFormat colorFormat,
               VkFormat depthFormat, VkSampleCountFlagBits sampleCount, const PipelineLayout& layout,
-              const PipelineLayout& computeLayout, const ShaderProgram& sp, const ShaderProgram& spCompute,
-              const VkVertexInputBindingDescription& bindDesc, span<const VkVertexInputAttributeDescription> attrDesc) {
+              const PipelineLayout& computeLayout, const ShaderProgram& sp, const ShaderProgram& spCube,
+              const ShaderProgram& spCompute, const VkVertexInputBindingDescription& bindDesc,
+              span<const VkVertexInputAttributeDescription> attrDesc) {
         m_renderTarget.resize(capacity);
         m_rp.Create(namer, device, colorFormat, depthFormat, sampleCount);
         VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_VIEWPORT};
         m_pipe.Create(device, size, layout, m_rp, sp, bindDesc, attrDesc, dynamicStates);
+        // Same layout and render pass, different shaders: this one consumes the cube vertex
+        // buffer's attributes, which the 360 pipeline's fullscreen-triangle shader ignores.
+        m_pipeCube.Create(device, size, layout, m_rp, spCube, bindDesc, attrDesc, dynamicStates);
 
         // m_pipeCompute not created because hello_xr doesn't need compute shaders
         (void)computeLayout;
@@ -365,6 +370,7 @@ struct VulkanArraySliceState {
 
     void Reset() {
         m_pipe.Reset();
+        m_pipeCube.Reset();
         m_pipeCompute.Reset();
         m_rp.Reset();
         m_renderTarget.clear();
@@ -374,12 +380,12 @@ struct VulkanArraySliceState {
 /// Vulkan data used per swapchain. One per XrSwapchain handle.
 class VulkanSwapchainImageData : public SwapchainImageDataBase<XrSwapchainImageVulkanKHR> {
     void init(uint32_t capacity, VkFormat colorFormat, const PipelineLayout& layout, const PipelineLayout& computeLayout,
-              const ShaderProgram& sp, const ShaderProgram& spCompute, const VkVertexInputBindingDescription& bindDesc,
-              span<const VkVertexInputAttributeDescription> attrDesc) {
+              const ShaderProgram& sp, const ShaderProgram& spCube, const ShaderProgram& spCompute,
+              const VkVertexInputBindingDescription& bindDesc, span<const VkVertexInputAttributeDescription> attrDesc) {
         m_depthBuffer.resize(capacity);
         for (auto& slice : m_slices) {
             slice.init(m_namer, m_vkDevice, capacity, m_size, colorFormat, m_depthFormat, m_sampleCount, layout, computeLayout, sp,
-                       spCompute, bindDesc, attrDesc);
+                       spCube, spCompute, bindDesc, attrDesc);
         }
     }
 
@@ -387,7 +393,8 @@ class VulkanSwapchainImageData : public SwapchainImageDataBase<XrSwapchainImageV
     VulkanSwapchainImageData(const VulkanDebugObjectNamer& namer, uint32_t capacity,
                              const XrSwapchainCreateInfo& swapchainCreateInfo, VkDevice device, MemoryAllocator* memAllocator,
                              const PipelineLayout& layout, const PipelineLayout& computeLayout, const ShaderProgram& sp,
-                             const ShaderProgram& spCompute, const VkVertexInputBindingDescription& bindDesc,
+                             const ShaderProgram& spCube, const ShaderProgram& spCompute,
+                             const VkVertexInputBindingDescription& bindDesc,
                              span<const VkVertexInputAttributeDescription> attrDesc)
         : SwapchainImageDataBase(XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR, capacity, swapchainCreateInfo),
           m_namer(namer),
@@ -396,14 +403,15 @@ class VulkanSwapchainImageData : public SwapchainImageDataBase<XrSwapchainImageV
           m_size{swapchainCreateInfo.width, swapchainCreateInfo.height},
           m_sampleCount{(VkSampleCountFlagBits)swapchainCreateInfo.sampleCount},
           m_slices(swapchainCreateInfo.arraySize) {
-        init(capacity, (VkFormat)swapchainCreateInfo.format, layout, computeLayout, sp, spCompute, bindDesc, attrDesc);
+        init(capacity, (VkFormat)swapchainCreateInfo.format, layout, computeLayout, sp, spCube, spCompute, bindDesc, attrDesc);
     }
 
     VulkanSwapchainImageData(const VulkanDebugObjectNamer& namer, uint32_t capacity,
                              const XrSwapchainCreateInfo& swapchainCreateInfo, XrSwapchain depthSwapchain,
                              const XrSwapchainCreateInfo& depthSwapchainCreateInfo, VkDevice device, MemoryAllocator* memAllocator,
                              const PipelineLayout& layout, const PipelineLayout& computeLayout, const ShaderProgram& sp,
-                             const ShaderProgram& spCompute, const VkVertexInputBindingDescription& bindDesc,
+                             const ShaderProgram& spCube, const ShaderProgram& spCompute,
+                             const VkVertexInputBindingDescription& bindDesc,
                              span<const VkVertexInputAttributeDescription> attrDesc)
         : SwapchainImageDataBase(XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR, capacity, swapchainCreateInfo, depthSwapchain,
                                  depthSwapchainCreateInfo),
@@ -414,7 +422,7 @@ class VulkanSwapchainImageData : public SwapchainImageDataBase<XrSwapchainImageV
           m_sampleCount{(VkSampleCountFlagBits)swapchainCreateInfo.sampleCount},
           m_depthFormat((VkFormat)depthSwapchainCreateInfo.format),
           m_slices(swapchainCreateInfo.arraySize) {
-        init(capacity, (VkFormat)swapchainCreateInfo.format, layout, computeLayout, sp, spCompute, bindDesc, attrDesc);
+        init(capacity, (VkFormat)swapchainCreateInfo.format, layout, computeLayout, sp, spCube, spCompute, bindDesc, attrDesc);
     }
 
     ~VulkanSwapchainImageData() override {
@@ -433,6 +441,10 @@ class VulkanSwapchainImageData : public SwapchainImageDataBase<XrSwapchainImageV
         renderPassBeginInfo->renderPass = rp.pass;
         renderPassBeginInfo->framebuffer = rt.fb;
         renderPassBeginInfo->renderArea = renderArea;
+    }
+
+    void BindCubePipeline(VkCommandBuffer buf, uint32_t arraySlice) {
+        vkCmdBindPipeline(buf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_slices[arraySlice].m_pipeCube.pipe);
     }
 
     void BindPipeline(VkCommandBuffer buf, uint32_t arraySlice, enum ShaderProgramType programType = SHADER_PROGRAM_TYPE_GRAPHICS) {
@@ -1541,6 +1553,24 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         m_shaderProgram.LoadVertexShader(vertexSPIRV);
         m_shaderProgram.LoadFragmentShader(fragmentSPIRV);
 
+        // Second, tiny shader pair for the tracked-pose cubes. The 360 pipeline draws a
+        // fullscreen triangle with no vertex attributes, so it cannot draw geometry at all --
+        // hence a separate pipeline rather than a branch in the existing shader. It shares
+        // m_pipelineLayout: the push-constant block is declared identically and only the
+        // leading mvp is read, so no second layout is needed.
+        std::vector<uint32_t> cubeVertexSPIRV = SPV_PREFIX
+#include "cube_vert.spv"
+            SPV_SUFFIX;
+        std::vector<uint32_t> cubeFragmentSPIRV = SPV_PREFIX
+#include "cube_frag.spv"
+            SPV_SUFFIX;
+        if (cubeVertexSPIRV.empty()) THROW("Failed to compile cube vertex shader");
+        if (cubeFragmentSPIRV.empty()) THROW("Failed to compile cube fragment shader");
+
+        m_cubeShaderProgram.Init(m_vkDevice);
+        m_cubeShaderProgram.LoadVertexShader(cubeVertexSPIRV);
+        m_cubeShaderProgram.LoadFragmentShader(cubeFragmentSPIRV);
+
         // Semaphore to block on draw complete
         VkSemaphoreCreateInfo semInfo{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         XRC_CHECK_THROW_VKCMD(vkCreateSemaphore(m_vkDevice, &semInfo, nullptr, &m_vkDrawDone));
@@ -1629,7 +1659,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     ISwapchainImageData* AllocateSwapchainImageData(size_t size, const XrSwapchainCreateInfo& swapchainCreateInfo) override {
         auto typedResult = std::make_unique<VulkanSwapchainImageData>(
             m_namer, uint32_t(size), swapchainCreateInfo, m_vkDevice, &m_memAllocator, m_pipelineLayout, m_computePipelineLayout,
-            m_shaderProgram, m_computeShaderProgram, m_drawBuffer.bindDesc, m_drawBuffer.attrDesc);
+            m_shaderProgram, m_cubeShaderProgram, m_computeShaderProgram, m_drawBuffer.bindDesc, m_drawBuffer.attrDesc);
 
         // Cast our derived type to the caller-expected type.
         auto ret = static_cast<ISwapchainImageData*>(typedResult.get());
@@ -1644,8 +1674,8 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         const XrSwapchainCreateInfo& depthSwapchainCreateInfo) override {
         auto typedResult = std::make_unique<VulkanSwapchainImageData>(
             m_namer, uint32_t(size), colorSwapchainCreateInfo, depthSwapchain, depthSwapchainCreateInfo, m_vkDevice,
-            &m_memAllocator, m_pipelineLayout, m_computePipelineLayout, m_shaderProgram, m_computeShaderProgram,
-            m_drawBuffer.bindDesc, m_drawBuffer.attrDesc);
+            &m_memAllocator, m_pipelineLayout, m_computePipelineLayout, m_shaderProgram, m_cubeShaderProgram,
+            m_computeShaderProgram, m_drawBuffer.bindDesc, m_drawBuffer.attrDesc);
 
         // Cast our derived type to the caller-expected type.
         auto ret = static_cast<ISwapchainImageData*>(typedResult.get());
@@ -1663,7 +1693,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     }
 
     void RenderView(const XrCompositionLayerProjectionView& layerView, const XrSwapchainImageBaseHeader* swapchainImage,
-                    int64_t /*swapchainFormat*/, const std::vector<Cube>& /*cubes*/) override {
+                    int64_t /*swapchainFormat*/, const std::vector<Cube>& cubes) override {
         CHECK(layerView.subImage.imageArrayIndex == 0);  // Texture arrays not supported.
 
         // RenderView runs once per eye, left then right, so the call parity IS the eye index.
@@ -1871,6 +1901,49 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // Fullscreen triangle, no vertex/index buffer needed.
         vkCmdDraw(m_cmdBuffer.buf, 3, 1, 0, 0);
 
+        // Tracked-pose cubes, drawn on top of the 360 background: one per controller, plus one
+        // per visualized reference space. Restored from the original hello_xr sample, which this
+        // player replaced wholesale with the fullscreen-triangle path -- the cubes vector has
+        // been arriving here fully populated and being discarded ever since.
+        //
+        // This is the in-headset instrument for controller tracking. Until the constellation
+        // series fuses a real position, the controller cubes are expected to sit still in space
+        // while the head moves around them: Monado pins untracked devices at a fixed offset from
+        // the tracking origin, which is a placeholder, not a bug. Head 6DoF is what they verify
+        // today -- a correctly tracked head makes them stay put in the world.
+        //
+        // The reference-space cubes are also the visual for the floor/height question: STAGE sits
+        // where the tracking origin is, which is wherever the headset was when SLAM initialised.
+        if (!cubes.empty()) {
+            swapchainData->BindCubePipeline(m_cmdBuffer.buf, imageArrayIndex);
+            vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
+
+            // Compute the view-projection once; the eye pose is the one already resolved above.
+            XrMatrix4x4f proj;
+            XrMatrix4x4f_CreateProjectionFov(&proj, GRAPHICS_VULKAN, layerView.fov, 0.05f, 100.0f);
+            XrMatrix4x4f toView;
+            XrVector3f identityScale{1.f, 1.f, 1.f};
+            XrMatrix4x4f_CreateTranslationRotationScale(&toView, &layerView.pose.position, &layerView.pose.orientation,
+                                                        &identityScale);
+            XrMatrix4x4f view;
+            XrMatrix4x4f_InvertRigidBody(&view, &toView);
+            XrMatrix4x4f vp;
+            XrMatrix4x4f_Multiply(&vp, &proj, &view);
+
+            for (const Cube& cube : cubes) {
+                XrMatrix4x4f model;
+                XrMatrix4x4f_CreateTranslationRotationScale(&model, &cube.Pose.position, &cube.Pose.orientation, &cube.Scale);
+                XrMatrix4x4f mvp;
+                XrMatrix4x4f_Multiply(&mvp, &vp, &model);
+                // Only the leading mvp of the shared push-constant block; the cube shader reads
+                // nothing else, and the 360 pipeline's own constants are re-pushed on the next
+                // frame before it draws again.
+                vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout,
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+                vkCmdDrawIndexed(m_cmdBuffer.buf, m_drawBuffer.count.idx, 1, 0, 0, 0);
+            }
+        }
+
         vkCmdEndRenderPass(m_cmdBuffer.buf);
 
         m_cmdBuffer.End();
@@ -1907,6 +1980,7 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
 
     MemoryAllocator m_memAllocator{};
     ShaderProgram m_shaderProgram{SHADER_PROGRAM_TYPE_GRAPHICS};
+    ShaderProgram m_cubeShaderProgram{SHADER_PROGRAM_TYPE_GRAPHICS};
     ShaderProgram m_computeShaderProgram{SHADER_PROGRAM_TYPE_COMPUTE};
     CmdBuffer m_cmdBuffer{};
     PipelineLayout m_pipelineLayout{};

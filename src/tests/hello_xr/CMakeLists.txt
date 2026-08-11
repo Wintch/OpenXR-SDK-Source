@@ -142,6 +142,33 @@ endif()
 add_custom_target(run_hello_xr_yuv_glsl ALL DEPENDS "${YUV_FRAG_SPV}")
 add_dependencies(hello_xr run_hello_xr_yuv_glsl)
 
+# The tracked-pose cube shaders, same story as yuv_frag above: compile_glsl allows only one
+# file per stage, and these are a second vertex/fragment pair.
+foreach(cube_stage vert frag)
+    set(CUBE_SPV "${CMAKE_CURRENT_BINARY_DIR}/cube_${cube_stage}.spv")
+    if(GLSL_COMPILER)
+        add_custom_command(
+            OUTPUT "${CUBE_SPV}"
+            COMMAND "${GLSL_COMPILER}" -mfmt=c -fshader-stage=${cube_stage}
+                    "vulkan_shaders/cube_${cube_stage}.glsl" -o "${CUBE_SPV}"
+            DEPENDS "vulkan_shaders/cube_${cube_stage}.glsl"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            VERBATIM
+        )
+    elseif(GLSLANG_VALIDATOR)
+        add_custom_command(
+            OUTPUT "${CUBE_SPV}"
+            COMMAND "${GLSLANG_VALIDATOR}" -V -S ${cube_stage}
+                    "vulkan_shaders/cube_${cube_stage}.glsl" -x -o "${CUBE_SPV}"
+            DEPENDS "vulkan_shaders/cube_${cube_stage}.glsl"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+            VERBATIM
+        )
+    endif()
+    add_custom_target(run_hello_xr_cube_${cube_stage}_glsl ALL DEPENDS "${CUBE_SPV}")
+    add_dependencies(hello_xr run_hello_xr_cube_${cube_stage}_glsl)
+endforeach()
+
 target_include_directories(
     hello_xr
     PRIVATE
