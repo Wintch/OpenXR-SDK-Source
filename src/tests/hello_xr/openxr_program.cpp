@@ -1453,8 +1453,28 @@ struct OpenXrProgram : IOpenXrProgram {
                 auto describe = [](const XrSpaceLocation& loc) {
                     const bool posValid = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
                     const bool posTracked = (loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) != 0;
-                    return Fmt("(%+6.3f %+6.3f %+6.3f) pos:%s trk:%s", loc.pose.position.x, loc.pose.position.y,
-                               loc.pose.position.z, posValid ? "OK" : "--", posTracked ? "OK" : "--");
+
+                    // Where the controller POINTS, not just where it is. Added 2026-08-12 so
+                    // controller orientation can be judged from a flat monitor instead of by
+                    // putting the headset on for every A/B -- and because "the left one points at
+                    // me" is a claim about a direction, which a number settles and an impression
+                    // does not. -Z is forward in OpenXR, so this is the grip's forward axis rotated
+                    // into the reference space, plus a plain-language reading of it.
+                    const XrQuaternionf& q = loc.pose.orientation;
+                    const float fx = -2.0f * (q.x * q.z + q.w * q.y);
+                    const float fy = -2.0f * (q.y * q.z - q.w * q.x);
+                    const float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+                    const char* dir = "?";
+                    if (fz < -0.5f) dir = "AWAY";        // pointing away from the wearer
+                    else if (fz > 0.5f) dir = "AT-ME";   // pointing back at the wearer
+                    else if (fx < -0.5f) dir = "LEFT";
+                    else if (fx > 0.5f) dir = "RIGHT";
+                    else if (fy > 0.5f) dir = "UP";
+                    else if (fy < -0.5f) dir = "DOWN";
+
+                    return Fmt("(%+6.3f %+6.3f %+6.3f) pos:%s trk:%s fwd(%+5.2f %+5.2f %+5.2f)=%s",
+                               loc.pose.position.x, loc.pose.position.y, loc.pose.position.z,
+                               posValid ? "OK" : "--", posTracked ? "OK" : "--", fx, fy, fz, dir);
                 };
 
                 Log::Write(Log::Level::Info, Fmt("POSE head (%+6.3f %+6.3f %+6.3f) | left %s | right %s", head.x,
