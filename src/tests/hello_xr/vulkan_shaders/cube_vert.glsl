@@ -17,7 +17,9 @@ layout (std140, push_constant) uniform buf
 {
     mat4 mvp;
     int gizmoAxis;  // -1 = off (ordinary per-face Color below). 0/1/2 = controller-gizmo
-                     // axis bar (X/Y/Z) - see PushPoseGizmo in openxr_program.cpp.
+                     // axis bar (X/Y/Z), dimmed on its own negative half. 3/4/5 = that axis's
+                     // POSITIVE-tip marker cube, always fully bright (see below) - see
+                     // PushPoseGizmo in openxr_program.cpp.
 } ubuf;
 
 layout (location = 0) in vec3 Position;
@@ -32,17 +34,26 @@ out gl_PerVertex
 void main()
 {
     if (ubuf.gizmoAxis >= 0) {
-        // Controller-gizmo axis bar: one solid colour per axis (+X red, +Y green, +Z blue),
-        // dimmed by the same 0.25 factor Geometry's Dark* colours already use elsewhere, on
-        // whichever half of the bar sits on the negative side of ITS OWN local axis - not by
-        // face identity, so every face of the bar (end caps AND the four long sides) reads the
+        // Controller-gizmo axis bar (0/1/2) or tip cube (3/4/5, axis + 3) - see
+        // PushPoseGizmo. Either way, one solid colour per axis: +X red, +Y green, +Z blue.
+        int axis = ubuf.gizmoAxis % 3;
+        bool isTip = ubuf.gizmoAxis >= 3;
+        vec3 axisColor = (axis == 0) ? vec3(1.0, 0.0, 0.0)
+                        : (axis == 1) ? vec3(0.0, 1.0, 0.0)
+                                      : vec3(0.0, 0.0, 1.0);
+
+        // Bars dim by the same 0.25 factor Geometry's Dark* colours already use elsewhere, on
+        // whichever half sits on the negative side of ITS OWN local axis - not by face
+        // identity, so every face of the bar (end caps AND the four long sides) reads the
         // right colour, not just the two tiny tips. Position is the mesh's local -0.5..+0.5
-        // unit-cube coordinate, so Position[gizmoAxis]'s sign is exactly that.
-        vec3 axisColor = (ubuf.gizmoAxis == 0) ? vec3(1.0, 0.0, 0.0)
-                        : (ubuf.gizmoAxis == 1) ? vec3(0.0, 1.0, 0.0)
-                                                 : vec3(0.0, 0.0, 1.0);
-        float t = (ubuf.gizmoAxis == 0) ? Position.x : (ubuf.gizmoAxis == 1) ? Position.y : Position.z;
-        float bright = (t >= 0.0) ? 1.0 : 0.25;
+        // unit-cube coordinate, so Position[axis]'s sign is exactly that.
+        //
+        // Tip cubes skip this entirely and are always full brightness: a plain cube's own
+        // local vertices split -0.5..+0.5 on EVERY axis no matter where the cube sits in the
+        // world, so testing Position[axis] here would render the marker half-bright/half-dim
+        // like a stub of bar instead of the solid cap it's meant to be.
+        float t = (axis == 0) ? Position.x : (axis == 1) ? Position.y : Position.z;
+        float bright = isTip ? 1.0 : ((t >= 0.0) ? 1.0 : 0.25);
         oColor.rgb = axisColor * bright;
     } else {
         oColor.rgb = Color.rgb;

@@ -761,17 +761,48 @@ struct OpenXrProgram : IOpenXrProgram {
      * mesh's baked per-face colours. Cube::GizmoAxis (0/1/2) is what tells cube_vert.glsl this
      * is a gizmo bar and which axis it is; -1 (the default for every other cube, reference
      * spaces included) keeps the original per-face colouring untouched.
+     *
+     * Tip cubes, added same day per the wearer's own live request ("metele un cubo en una punta
+     * de cada eje"): one small solid cube capping the POSITIVE end of each bar only, slightly
+     * larger than the bar's cross-section. Nothing marks the negative end. The asymmetry is the
+     * point -- it makes handedness readable at a glance (three colour-coded caps, not a
+     * symmetric jack), and because the three caps move as a rigid unit with the bars, an
+     * unexpected pivot offset (rotation happening around a point that visibly isn't where the
+     * caps converge) becomes obvious too. Encoded as GizmoAxis 3/4/5 (bar axis + 3) rather than
+     * reusing 0/1/2 directly: a plain cube's own local vertices split -0.5..+0.5 on EVERY axis
+     * regardless of where the cube is placed in the world, so naively tagging a tip cube with
+     * the bar's own axis value would render it half-bright/half-dim like a tiny bar segment, not
+     * the solid marker asked for -- cube_vert.glsl's `gizmoAxis >= 3` case forces full brightness
+     * unconditionally instead of testing the vertex's local sign.
      */
     static void PushPoseGizmo(std::vector<Cube>& cubes, const XrPosef& pose, float scale) {
         constexpr float kLength = 0.12f;
         constexpr float kThick = 0.012f;
+        // ~1.75x the bar's own cross-section (matches the wearer's own "3.5cm cube on a 2cm
+        // bar" example ratio) -- big enough to read as a deliberate marker, not just a thicker
+        // bit of bar.
+        constexpr float kTipCube = kThick * 1.75f;
         const float len = kLength * scale;
         const float thick = kThick * scale;
+        const float tipCube = kTipCube * scale;
 
         const XrVector3f sizes[3] = {{len, thick, thick}, {thick, len, thick}, {thick, thick, len}};
+        const XrVector3f tipOffsetLocal[3] = {{len * 0.5f, 0.f, 0.f}, {0.f, len * 0.5f, 0.f}, {0.f, 0.f, len * 0.5f}};
+        const XrVector3f tipScale{tipCube, tipCube, tipCube};
 
         for (int axis = 0; axis < 3; axis++) {
             cubes.push_back(Cube{pose, sizes[axis], axis});
+
+            // Tip cube, centered exactly at the bar's positive end (the same point local
+            // Position[axis] == +0.5 on the bar maps to), so it caps the bar rather than
+            // floating past or short of it.
+            XrVector3f tipOffsetWorld;
+            XrQuaternionf_RotateVector3f(&tipOffsetWorld, &pose.orientation, &tipOffsetLocal[axis]);
+            XrPosef tipPose = pose;
+            tipPose.position.x += tipOffsetWorld.x;
+            tipPose.position.y += tipOffsetWorld.y;
+            tipPose.position.z += tipOffsetWorld.z;
+            cubes.push_back(Cube{tipPose, tipScale, axis + 3});
         }
     }
 

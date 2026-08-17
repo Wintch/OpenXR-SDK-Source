@@ -16,8 +16,9 @@ struct Cube {
     // (Geometry::c_cubeVertices). 0/1/2: a controller-gizmo axis bar (X/Y/Z) - see
     // PushPoseGizmo in openxr_program.cpp - rendered as a single solid axis color instead,
     // bright on its own positive half and dim on its negative half (see cube_vert.glsl).
-    // Reference-space cubes and everything else built with the 2-argument Cube{Pose, Scale}
-    // form are unaffected: this just defaults to "off".
+    // 3/4/5 (axis + 3): that same axis's positive-tip marker cube, always full brightness,
+    // no light/dark split. Reference-space cubes and everything else built with the
+    // 2-argument Cube{Pose, Scale} form are unaffected: this just defaults to "off".
     int32_t GizmoAxis{-1};
 };
 
