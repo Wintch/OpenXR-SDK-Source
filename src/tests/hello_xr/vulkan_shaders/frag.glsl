@@ -19,7 +19,10 @@ layout (std140, push_constant) uniform buf
     vec4 fovTangents;     // tan(angleLeft), tan(angleRight), tan(angleUp), tan(angleDown)
     vec4 uvScaleOffset;   // xy scale, zw offset: this eye's sub-rectangle of a stereo frame
     vec4 panoFov;         // 180: half-angles in radians. flat: half-extents of the screen.
-    ivec4 mode;           // x: PROJ_*
+    ivec4 mode;           // x: PROJ_* in bits 0-3, eye in bit 4, HELLO_XR_TEST_PATTERN in
+                           // bits 5-6 (see below), counter-mode frame count/phase in bits
+                           // 7-14/15-16. y/z/w: progress bar and quit-hold, see near the
+                           // bottom of this file (also reused by card/toggle test patterns).
 } ubuf;
 
 layout (set = 0, binding = 0) uniform sampler2D equirectTex;
@@ -27,11 +30,116 @@ layout (set = 0, binding = 0) uniform sampler2D equirectTex;
 layout (location = 0) in vec2 iNdc;
 layout (location = 0) out vec4 FragColor;
 
+// sRGB (display code value, 0..1) -> linear light. The player's swapchain format is *_SRGB
+// (see SelectColorSwapchainFormat in graphicsplugin_vulkan.cpp), so the GPU re-encodes
+// whatever a shader writes here on the way into the framebuffer - a value has to be
+// pre-compensated with this to land on the panel at the CODE VALUE named, not at that value
+// again after a second gamma curve. Used by CardColor below; the .cpp has its own copy for
+// the toggle-mode gray pair, since host and shader can't share code across that boundary.
+float SrgbToLinear(float c)
+{
+    return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+// HELLO_XR_TEST_PATTERN=card (see graphicsplugin_vulkan.cpp): thin white border + checkerboard
+// corner markers around an interior fill that swaps with the background grey on mode.y (0 or
+// 1 - set from the same frame counter/cadence toggle mode uses). The two greys are the
+// ~10%/~40% sRGB pair mode 1's "gray" toggle also uses (see kTogglePairs in the .cpp) -
+// interior and background are always opposite members of that pair, so the whole quad+
+// backdrop only ever shows those two values, just swapping which region has which.
+vec3 CardColor(vec2 uv, float inside)
+{
+    float dark = SrgbToLinear(0.10);
+    float mid = SrgbToLinear(0.40);
+    bool swapped = ubuf.mode.y != 0;
+    float interiorGrey = swapped ? mid : dark;
+    float backgroundGrey = swapped ? dark : mid;
+
+    if (inside < 0.5) {
+        return vec3(backgroundGrey);
+    }
+
+    // Thin white outline just inside the quad's edge - a static, always-sharp reference so
+    // edge-arrival can be judged separately from how long the larger fill areas take to settle.
+    float edgeDist = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    if (edgeDist < 0.03) {
+        return vec3(1.0);
+    }
+
+    // Checkerboard corner markers: a fine black/white grid in each corner, inside the border.
+    const float kCornerSize = 0.18;
+    const float kCell = 0.03;
+    bool inCornerX = (uv.x < kCornerSize) || (uv.x > 1.0 - kCornerSize);
+    bool inCornerY = (uv.y < kCornerSize) || (uv.y > 1.0 - kCornerSize);
+    if (inCornerX && inCornerY) {
+        float cx = floor(uv.x / kCell);
+        float cy = floor(uv.y / kCell);
+        bool white = mod(cx + cy, 2.0) < 1.0;
+        return vec3(white ? 1.0 : 0.0);
+    }
+
+    return vec3(interiorGrey);
+}
+
+// HELLO_XR_TEST_PATTERN=counter (see graphicsplugin_vulkan.cpp): a small head-locked patch,
+// screen-space only like the progress/quit-hold bars further down, so an external high-speed
+// camera can read off exactly which rendered frame is on screen. modeX bits 7-14 carry a
+// wrapping 0-255 frame counter (bit on = white, off = black, 8 blocks packed 4x2, MSB first);
+// bits 15-16 carry a color phase (0=R 1=G 2=B, cycling every frame) shown in the gaps between
+// blocks - a coarse signal visible even out of focus, on top of the precise per-frame count.
+// Returns false (and leaves FragColor untouched) outside the patch.
+bool CounterPatch(float s, float t, int modeX)
+{
+    const float kPatchSMin = 0.03, kPatchSMax = 0.25;
+    const float kPatchTMin = 0.72, kPatchTMax = 0.92;
+    if (s < kPatchSMin || s > kPatchSMax || t < kPatchTMin || t > kPatchTMax) {
+        return false;
+    }
+
+    int counter = (modeX >> 7) & 0xFF;
+    int phase = (modeX >> 15) & 0x3;
+    vec3 phaseColor = (phase == 0) ? vec3(1.0, 0.0, 0.0) : (phase == 1) ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+
+    float ps = (s - kPatchSMin) / (kPatchSMax - kPatchSMin) * 4.0;
+    float pt = (t - kPatchTMin) / (kPatchTMax - kPatchTMin) * 2.0;
+    float cellS = fract(ps);
+    float cellT = fract(pt);
+    int bitIndex = int(pt) * 4 + int(ps);
+    bool bitOn = ((counter >> (7 - bitIndex)) & 1) != 0;
+    bool inBlock = cellS > 0.12 && cellS < 0.88 && cellT > 0.12 && cellT < 0.88;
+
+    FragColor = vec4(inBlock ? (bitOn ? vec3(1.0) : vec3(0.0)) : phaseColor, 1.0);
+    return true;
+}
+
 void main()
 {
     // Vulkan NDC: x runs -1 (left) .. +1 (right), y runs -1 (top) .. +1 (bottom).
     float s = iNdc.x * 0.5 + 0.5;
     float t = iNdc.y * 0.5 + 0.5;
+
+    // HELLO_XR_TEST_PATTERN (see graphicsplugin_vulkan.cpp for how mode.x's bits 5-6 get set,
+    // and docs/pruebas.jsonl T206 in the lab repo for why this exists - a suspected LCD
+    // strobe-crosstalk/gray-to-gray artifact needing patterns that isolate the display chain
+    // from tracking/reprojection/content-decode). 0 (unset) takes none of these branches, so
+    // behavior is byte-identical to before this feature existed.
+    int testPattern = (ubuf.mode.x >> 5) & 0x3;
+
+    // TOGGLE: full-field solid color, zero geometry, zero motion - returns before any of the
+    // ray/projection math below runs. Color comes straight from fovTangents (see the .cpp -
+    // that slot is unused by this mode, reused instead of growing the push-constant struct).
+    if (testPattern == 1) {
+        FragColor = vec4(ubuf.fovTangents.rgb, 1.0);
+        return;
+    }
+
+    // COUNTER: also screen-space only, checked here ahead of all the ray/projection math since
+    // it never needs any of it, and must win over the `discard` below for pixels outside the
+    // loaded content - easiest to guarantee by simply returning before reaching that check.
+    if (testPattern == 3 && CounterPatch(s, t, ubuf.mode.x)) {
+        return;
+    }
+
     float xv = mix(ubuf.fovTangents.x, ubuf.fovTangents.y, s);  // left -> right
     float yv = mix(ubuf.fovTangents.z, ubuf.fovTangents.w, t);  // up -> down
 
@@ -75,6 +183,15 @@ void main()
             uv = vec2(az / (2.0 * PI) + 0.5, 0.5 - el / PI);
             wraps = true;
         }
+    }
+
+    // CARD: reuses the PROJ_FLAT uv/inside just computed above - a world-locked flat quad is
+    // exactly that path's own geometry (the .cpp forces projType to PROJ_FLAT whenever this
+    // mode is active, regardless of the loaded content's real projection). Paints the WHOLE
+    // screen, inside the quad or not, instead of discarding - see CardColor above.
+    if (testPattern == 2) {
+        FragColor = vec4(CardColor(uv, inside), 1.0);
+        return;
     }
 
     // u wraps from 1 back to 0 at the seam behind the viewer. The implicit derivative there is

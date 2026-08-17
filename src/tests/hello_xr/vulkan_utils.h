@@ -943,7 +943,12 @@ struct VulkanUniformBuffer {
     float uvScaleOffset[4];   // this eye's sub-rectangle of a stereo frame
     float panoFov[4];         // xy: 180 half-angles (rad) / flat half-extents. z: zoom (1=off).
                                // w: brightness multiplier (1=off).
-    int32_t mode[4];          // x: 0 = 360 equirect, 1 = 180 half-equirect, 2 = flat screen
+    int32_t mode[4];          // x: bits 0-3 = 0 = 360 equirect, 1 = 180 half-equirect, 2 = flat
+                               // screen; bit 4 = eye; bits 5-6 = HELLO_XR_TEST_PATTERN (0 off,
+                               // 1 toggle, 2 card, 3 counter - see graphicsplugin_vulkan.cpp
+                               // and frag.glsl); bits 7-14/15-16 = counter mode's frame count /
+                               // color phase, unused otherwise. y/z/w: progress bar and
+                               // quit-hold fields (frag.glsl), reused by card/toggle mode.
 };
 
 // Simple vertex MVP xform, tint color & color fragment shader layout

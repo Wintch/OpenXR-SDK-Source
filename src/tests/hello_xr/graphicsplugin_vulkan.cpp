@@ -23,6 +23,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <system_error>
 
@@ -497,6 +499,42 @@ class VulkanSwapchainImageData : public SwapchainImageDataBase<XrSwapchainImageV
 
     std::vector<VulkanArraySliceState> m_slices;
 };
+
+// HELLO_XR_TEST_PATTERN diagnostics: three env-selected display test patterns for isolating
+// the display chain (panel/strobe/gray-to-gray response) from tracking, reprojection and
+// content decode - see docs/pruebas.jsonl T206 in the lab's reverb-g2 repo for the "late
+// color fill-in" artifact this exists to chase down. Kept entirely inside RenderView's
+// existing push-constant/shader path (frag.glsl) instead of standing up a new pipeline; see
+// the comments there for how mode.x's spare bits and the panoFov/fovTangents push-constant
+// slots (already reused for zoom/brightness/the progress bar - the struct is at Vulkan's
+// guaranteed 128-byte push-constant limit, see vulkan_utils.h) get borrowed again here.
+enum class TestPattern : int32_t { Off = 0, Toggle = 1, Card = 2, Counter = 3 };
+
+// sRGB (display code value, 0..1) -> linear light. The player's swapchain format is *_SRGB
+// (see SelectColorSwapchainFormat below), so the GPU re-encodes whatever a shader writes as
+// it lands in the framebuffer - a value has to be pre-compensated so it lands on the panel
+// at the CODE VALUE named, not at that value again after a second gamma curve. Used to build
+// the toggle pair table below; frag.glsl's CardColor has its own copy for the same reason
+// (host and shader can't share code across that boundary).
+float SrgbToLinear(float c) { return (c <= 0.04045f) ? (c / 12.92f) : powf((c + 0.055f) / 1.055f, 2.4f); }
+
+// The three required toggle pairs (HELLO_XR_TEST_TOGGLE_PAIR selects the starting one, cycled
+// at runtime by the next/prev-track controller input - see the "test pattern" block in
+// RenderView below).
+struct TogglePair {
+    XrColor4f a, b;
+};
+const TogglePair kTogglePairs[] = {
+    // bw: black <-> white, the fast-GtG control.
+    {{0.0f, 0.0f, 0.0f, 1.0f}, {1.0f, 1.0f, 1.0f, 1.0f}},
+    // gray: ~10% <-> ~40% sRGB, the documented slow-GtG case.
+    {{SrgbToLinear(0.10f), SrgbToLinear(0.10f), SrgbToLinear(0.10f), 1.0f},
+     {SrgbToLinear(0.40f), SrgbToLinear(0.40f), SrgbToLinear(0.40f), 1.0f}},
+    // sat: two saturated colors, chosen as different hues (not just different brightnesses of
+    // one) so every subpixel channel actually transitions, not just luminance.
+    {{1.0f, 0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, 1.0f, 1.0f}},
+};
+constexpr int kNumTogglePairs = sizeof(kTogglePairs) / sizeof(kTogglePairs[0]);
 
 struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VulkanGraphicsPlugin() { m_graphicsBinding.type = GetGraphicsBindingType(); };
@@ -1728,6 +1766,53 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             if (m_videoMode) UpdateVideoTexture();
         }
 
+        // HELLO_XR_TEST_PATTERN (see the TestPattern enum + kTogglePairs table near the top
+        // of this file). Parsed every call like HELLO_XR_FIXED_POSE/HELLO_XR_POSE_STATS
+        // above - getenv is cheap and this keeps the same not-cached convention.
+        TestPattern testPattern = TestPattern::Off;
+        if (const char* v = getenv("HELLO_XR_TEST_PATTERN")) {
+            if (strcmp(v, "toggle") == 0)
+                testPattern = TestPattern::Toggle;
+            else if (strcmp(v, "card") == 0)
+                testPattern = TestPattern::Card;
+            else if (strcmp(v, "counter") == 0)
+                testPattern = TestPattern::Counter;
+            else
+                Log::Write(Log::Level::Warning,
+                           Fmt("HELLO_XR_TEST_PATTERN='%s' not recognized (want toggle|card|counter) - ignoring", v));
+        }
+
+        if (testPattern != TestPattern::Off && eye == 0) {
+            ++m_testPatternFrame;
+
+            // Toggle mode repurposes the next/prev-track controller input (Y/X, or n/p on the
+            // keyboard - see playercontrol.h) to cycle the color pair: track navigation is
+            // meaningless here since this mode has no playlist reason to run against real
+            // video, and reusing the binding avoids adding a new controller action just for
+            // this. Left alone in video mode - the block above already owns that input there.
+            if (testPattern == TestPattern::Toggle && !m_videoMode) {
+                if (!m_testPatternPairInited) {
+                    m_testPatternPairInited = true;
+                    if (const char* v = getenv("HELLO_XR_TEST_TOGGLE_PAIR")) {
+                        if (strcmp(v, "bw") == 0)
+                            m_testPatternPairIndex = 0;
+                        else if (strcmp(v, "gray") == 0)
+                            m_testPatternPairIndex = 1;
+                        else if (strcmp(v, "sat") == 0)
+                            m_testPatternPairIndex = 2;
+                        else
+                            Log::Write(Log::Level::Warning, Fmt("HELLO_XR_TEST_TOGGLE_PAIR='%s' not recognized "
+                                                                "(want bw|gray|sat) - using bw", v));
+                    }
+                }
+                const long delta = PlayerControl::TakeNextTrackRequest() - PlayerControl::TakePreviousTrackRequest();
+                if (delta != 0) {
+                    m_testPatternPairIndex =
+                        (int)(((m_testPatternPairIndex + delta) % kNumTogglePairs + kNumTogglePairs) % kNumTogglePairs);
+                }
+            }
+        }
+
         VulkanSwapchainImageData* swapchainData;
         uint32_t imageIndex;
 
@@ -1892,6 +1977,59 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             }
             pushConstants.mode[2] = (PlayerControl::SecondsSinceLastInteraction() < 3.0) ? 255 : 0;
         }
+
+        // Test pattern override: everything above computed pushConstants exactly as it would
+        // without HELLO_XR_TEST_PATTERN set (so the field stays byte-identical when it's
+        // unset) - this overwrites whatever fields each mode actually needs, on top of that.
+        // See frag.glsl for what each does with them.
+        if (testPattern != TestPattern::Off) {
+            int toggleFrames = 8;
+            if (const char* v = getenv("HELLO_XR_TEST_TOGGLE_FRAMES")) {
+                const int parsed = atoi(v);
+                if (parsed > 0) toggleFrames = parsed;
+            }
+            const bool swapped = ((m_testPatternFrame / (uint64_t)toggleFrames) % 2) != 0;
+
+            switch (testPattern) {
+                case TestPattern::Toggle: {
+                    const TogglePair& pair = kTogglePairs[m_testPatternPairIndex];
+                    pushConstants.tintColor = swapped ? pair.b : pair.a;
+                    pushConstants.mode[0] = (int32_t)TestPattern::Toggle << 5;
+                    pushConstants.mode[1] = pushConstants.mode[2] = pushConstants.mode[3] = 0;
+                    break;
+                }
+                case TestPattern::Card: {
+                    // Forces PROJ_FLAT regardless of the loaded content's own projection -
+                    // frag.glsl reuses that path's uv/inside math for the quad itself. The
+                    // loaded photo/video is otherwise unused in this mode, just a placeholder
+                    // to satisfy the pipeline's normal startup path (LoadPhotoTexture etc.).
+                    pushConstants.mode[0] = 2 /* PROJ_FLAT */ | ((int32_t)TestPattern::Card << 5);
+                    if (eye == 1) pushConstants.mode[0] |= 0x10;
+                    // ~0.6m card at ~1m: tangent-unit half-extent (see projection360.h's
+                    // comment on panoFov for Flat mode - tan(angle), not radians).
+                    pushConstants.panoFov[0] = 0.30f;
+                    pushConstants.panoFov[1] = 0.30f;
+                    pushConstants.panoFov[2] = 1.0f;  // zoom forced off - "~1m ahead" shouldn't drift
+                    pushConstants.panoFov[3] = 1.0f;  // brightness forced off - would shift the exact greys
+                    pushConstants.mode[1] = swapped ? 1 : 0;
+                    pushConstants.mode[2] = pushConstants.mode[3] = 0;
+                    break;
+                }
+                case TestPattern::Counter: {
+                    // Purely additive - everything else about this frame (real content, real
+                    // projection, the real progress bar) is untouched; only a few spare high
+                    // bits get set for frag.glsl's CounterPatch corner overlay.
+                    const uint32_t counter = (uint32_t)(m_testPatternFrame & 0xFF);
+                    const uint32_t phase = (uint32_t)(m_testPatternFrame % 3);
+                    pushConstants.mode[0] |=
+                        ((int32_t)TestPattern::Counter << 5) | ((int32_t)counter << 7) | ((int32_t)phase << 15);
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+
         vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(pushConstants), &pushConstants);
 
@@ -1914,7 +2052,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         //
         // The reference-space cubes are also the visual for the floor/height question: STAGE sits
         // where the tracking origin is, which is wherever the headset was when SLAM initialised.
-        if (!cubes.empty()) {
+        //
+        // Suppressed for the toggle/card test patterns (HELLO_XR_TEST_PATTERN): they own the
+        // whole screen and a stray controller/reference-space cube drawn on top would be
+        // exactly the kind of world geometry those modes exist to rule out. Counter mode is
+        // left alone - it's a small additive overlay on otherwise-normal content, cubes and all.
+        const bool suppressCubesForTestPattern = (testPattern == TestPattern::Toggle || testPattern == TestPattern::Card);
+        if (!cubes.empty() && !suppressCubesForTestPattern) {
             swapchainData->BindCubePipeline(m_cmdBuffer.buf, imageArrayIndex);
             vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
 
@@ -2035,6 +2179,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
     VkShaderModule m_videoVertModule{VK_NULL_HANDLE};
     VkShaderModule m_videoFragModule{VK_NULL_HANDLE};
     uint64_t m_renderViewCalls{0};
+
+    // HELLO_XR_TEST_PATTERN state - see the TestPattern enum near the top of this file. Has
+    // to be a member (not a local): the frame counter and pair selection must survive both
+    // eyes of one frame and carry over between frames, unlike pushConstants itself.
+    uint64_t m_testPatternFrame{0};
+    int m_testPatternPairIndex{0};
+    bool m_testPatternPairInited{false};
 
     VkImage m_photoImage{VK_NULL_HANDLE};
     VkDeviceMemory m_photoImageMemory{VK_NULL_HANDLE};
