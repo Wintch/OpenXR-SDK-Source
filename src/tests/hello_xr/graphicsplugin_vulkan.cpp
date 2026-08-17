@@ -2079,11 +2079,17 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                 XrMatrix4x4f_CreateTranslationRotationScale(&model, &cube.Pose.position, &cube.Pose.orientation, &cube.Scale);
                 XrMatrix4x4f mvp;
                 XrMatrix4x4f_Multiply(&mvp, &vp, &model);
-                // Only the leading mvp of the shared push-constant block; the cube shader reads
-                // nothing else, and the 360 pipeline's own constants are re-pushed on the next
-                // frame before it draws again.
+                // mvp plus one int (Cube::GizmoAxis) - see cube_vert.glsl, which reads the two
+                // together as its own independent interpretation of the shared push-constant
+                // range (the 360 pipeline's own constants are re-pushed on the next frame
+                // before it draws again, so nothing here needs to match that struct's layout
+                // past what cube_vert.glsl itself declares).
+                struct {
+                    XrMatrix4x4f mvp;
+                    int32_t gizmoAxis;
+                } cubePush{mvp, cube.GizmoAxis};
                 vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout,
-                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(mvp.m), &mvp.m[0]);
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(cubePush), &cubePush);
                 vkCmdDrawIndexed(m_cmdBuffer.buf, m_drawBuffer.count.idx, 1, 0, 0, 0);
             }
         }

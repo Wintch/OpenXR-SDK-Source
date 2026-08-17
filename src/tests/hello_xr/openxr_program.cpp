@@ -748,10 +748,19 @@ struct OpenXrProgram : IOpenXrProgram {
      * frame unambiguous: X to the device's right, Y up, Z backward (OpenXR's -Z is forward, so
      * the Z bar points back out of the muzzle).
      *
-     * Bars are offset by half their length along their own axis so they meet at the pose origin
-     * rather than straddling it, which keeps the origin itself readable as the point where the
-     * three meet. Colours come from the cube mesh's own per-face vertex colours, so the three are
-     * told apart by direction rather than by hue.
+     * Each bar is centered ON the pose and spans it symmetrically (half in its axis's own +
+     * direction, half in -), so all three still cross exactly at the pose origin -- and now the
+     * +/- split is real geometry, not just an arbitrary "arm". Found 2026-08-17 (T206, the
+     * wearer live-debugging orientation): the previous "tell them apart by direction" via the
+     * cube mesh's own per-face colours failed in practice -- a bar's two tiny end caps carried
+     * the right colour, but its four long side faces (the vast majority of what's visible from
+     * any angle) showed whatever OTHER axis happened to own that face, so every bar read as a
+     * confusing multi-colour smear. Now each bar is a single solid axis colour on every face
+     * (+X red, +Y green, +Z blue, dim on the negative half) -- see cube_vert.glsl, which derives
+     * the colour from the vertex's own local position along the bar's axis instead of from the
+     * mesh's baked per-face colours. Cube::GizmoAxis (0/1/2) is what tells cube_vert.glsl this
+     * is a gizmo bar and which axis it is; -1 (the default for every other cube, reference
+     * spaces included) keeps the original per-face colouring untouched.
      */
     static void PushPoseGizmo(std::vector<Cube>& cubes, const XrPosef& pose, float scale) {
         constexpr float kLength = 0.12f;
@@ -759,19 +768,10 @@ struct OpenXrProgram : IOpenXrProgram {
         const float len = kLength * scale;
         const float thick = kThick * scale;
 
-        const XrVector3f axes[3] = {{len * 0.5f, 0.f, 0.f}, {0.f, len * 0.5f, 0.f}, {0.f, 0.f, len * 0.5f}};
         const XrVector3f sizes[3] = {{len, thick, thick}, {thick, len, thick}, {thick, thick, len}};
 
         for (int axis = 0; axis < 3; axis++) {
-            XrVector3f offset;
-            XrQuaternionf_RotateVector3f(&offset, &pose.orientation, &axes[axis]);
-
-            XrPosef barPose = pose;
-            barPose.position.x += offset.x;
-            barPose.position.y += offset.y;
-            barPose.position.z += offset.z;
-
-            cubes.push_back(Cube{barPose, sizes[axis]});
+            cubes.push_back(Cube{pose, sizes[axis], axis});
         }
     }
 

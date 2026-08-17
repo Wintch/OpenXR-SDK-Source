@@ -11,6 +11,14 @@ using nonstd::span;
 struct Cube {
     XrPosef Pose;
     XrVector3f Scale;
+
+    // -1 (default): an ordinary cube, colored per-face like every cube has always been
+    // (Geometry::c_cubeVertices). 0/1/2: a controller-gizmo axis bar (X/Y/Z) - see
+    // PushPoseGizmo in openxr_program.cpp - rendered as a single solid axis color instead,
+    // bright on its own positive half and dim on its negative half (see cube_vert.glsl).
+    // Reference-space cubes and everything else built with the 2-argument Cube{Pose, Scale}
+    // form are unaffected: this just defaults to "off".
+    int32_t GizmoAxis{-1};
 };
 
 // Wraps a graphics API so the main openxr program can be graphics API-independent.
