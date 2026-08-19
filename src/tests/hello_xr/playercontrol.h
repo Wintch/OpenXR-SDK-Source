@@ -72,6 +72,13 @@ double SecondsSinceLastInteraction();
 // True once a quit key has been pressed.
 bool QuitRequested();
 
+// Same flag QuitRequested() reports, set directly rather than through a keypress - used by
+// main.cpp's HELLO_XR_DURATION_S timer so an expired duration ends the run through the exact
+// same graceful path as pressing q (openxr_program.cpp's PollActions calls
+// xrRequestExitSession() once it sees QuitRequested() true), instead of needing its own
+// parallel shutdown route.
+void RequestQuit();
+
 // How far into the hold-to-confirm quit gesture the WMR Menu button is (0..1), written by
 // openxr_program.cpp's PollActions each frame and read by the renderer for the on-screen
 // hold indicator. 0 when Menu isn't held or the hold was released early.

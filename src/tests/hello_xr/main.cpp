@@ -338,6 +338,35 @@ int main(int argc, char* argv[]) {
             const char* anyKeyQuits = getenv("HELLO_XR_ANY_KEY_QUITS");
             PlayerControl::SetAnyKeyQuits(anyKeyQuits != nullptr && strcmp(anyKeyQuits, "1") == 0);
         }
+
+        // HELLO_XR_DURATION_S=<seconds>: end the run automatically after this many seconds of
+        // process time, through PlayerControl::RequestQuit() - the exact same graceful path as
+        // pressing q (openxr_program.cpp's PollActions sees QuitRequested() and calls
+        // xrRequestExitSession() once), not a SIGTERM. 0 means run forever. Unset preserves the
+        // current behavior exactly: hello_xr has never self-limited its own runtime, only ever
+        // reacted to stdin EOF (see ReadKeyByte/HandleKey above) or an external `timeout`.
+        //
+        // Found 2026-08-19 (T221): a real measurement window kept dying at ~300s even with
+        // stdin held open via `sleep 14400 | ...`, which should have blocked forever short of
+        // EOF. There is no such limit anywhere in this codebase (checked the whole render loop
+        // and every player patch) - the ~300s was play360.sh's SECONDS_TO_RUN=300 default,
+        // which wraps hello_xr in `timeout 300`. `timeout` kills on a SIGTERM regardless of
+        // stdin, so the documented EOF trap looked like the cause but wasn't. This gives
+        // hello_xr its own internal, gracefully-exiting duration option so a direct invocation
+        // doesn't need an external `timeout` (and its abrupt SIGTERM) to bound a run at all.
+        double durationSeconds = 0.0;
+        if (const char* v = getenv("HELLO_XR_DURATION_S")) {
+            const int parsed = atoi(v);
+            if (parsed >= 0) {
+                durationSeconds = (double)parsed;
+            } else {
+                Log::Write(Log::Level::Warning,
+                           Fmt("HELLO_XR_DURATION_S='%s' not a non-negative integer - ignoring (running forever)", v));
+            }
+        }
+        const auto processStart = std::chrono::steady_clock::now();
+        bool durationQuitRequested = false;
+
         static bool quitKeyPressed = false;
         PlayerControl::BeginRawInput();
         std::atexit(PlayerControl::EndRawInput);
@@ -419,6 +448,20 @@ int main(int argc, char* argv[]) {
                 program->PollEvents(&exitRenderLoop, &requestRestart);
                 if (exitRenderLoop) {
                     break;
+                }
+
+                // HELLO_XR_DURATION_S: latched so this only fires once - RequestQuit() just
+                // flips a flag (harmless to call again), but the log line would otherwise
+                // repeat every frame for however long PollActions/session teardown takes.
+                if (durationSeconds > 0.0 && !durationQuitRequested) {
+                    const double elapsed =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - processStart).count();
+                    if (elapsed >= durationSeconds) {
+                        Log::Write(Log::Level::Info,
+                                   Fmt("player: HELLO_XR_DURATION_S=%.0f elapsed - quitting", durationSeconds));
+                        PlayerControl::RequestQuit();
+                        durationQuitRequested = true;
+                    }
                 }
 
                 if (program->IsSessionRunning()) {

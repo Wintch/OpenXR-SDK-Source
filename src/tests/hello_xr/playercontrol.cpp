@@ -229,6 +229,8 @@ double SecondsSinceLastInteraction() {
 
 bool QuitRequested() { return g_quit; }
 
+void RequestQuit() { g_quit = true; }
+
 void SetAnyKeyQuits(bool on) { g_anyKeyQuits = on; }
 
 void SetQuitHoldFraction(double frac) {
