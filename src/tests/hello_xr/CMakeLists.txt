@@ -193,16 +193,33 @@ if(XR_USE_GRAPHICS_API_VULKAN)
 endif()
 
 # 360 equirectangular video playback (video360.cpp). Optional - without ffmpeg the viewer
-# still shows still photos, it just refuses HELLO_XR_VIDEO360.
+# still shows still photos, it just refuses HELLO_XR_VIDEO360. libswresample rides along
+# with the rest of ffmpeg (it's used for the optional stereo audio path below, converting
+# whatever the file carries to a fixed S16/48000/stereo format).
 find_package(PkgConfig QUIET)
 if(PKG_CONFIG_FOUND)
     pkg_check_modules(
-        FFMPEG IMPORTED_TARGET libavcodec libavformat libavutil libswscale
+        FFMPEG IMPORTED_TARGET libavcodec libavformat libavutil libswscale libswresample
     )
 endif()
 if(FFMPEG_FOUND)
     target_link_libraries(hello_xr PRIVATE PkgConfig::FFMPEG)
     target_compile_definitions(hello_xr PRIVATE HAVE_FFMPEG)
+
+    # Optional stereo audio for the 360/VR180 player, gated at runtime by HELLO_XR_AUDIO=1
+    # (video360.cpp). Output goes through pa_simple, the PulseAudio-compatible blocking API
+    # PipeWire's own Pulse shim implements - the same path the rest of this rig's audio
+    # already uses. Not required to build: without it, HELLO_XR_AUDIO simply has no effect
+    # and the player is exactly the silent demo it always was.
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(PULSE_SIMPLE IMPORTED_TARGET libpulse-simple)
+    endif()
+    if(PULSE_SIMPLE_FOUND)
+        target_link_libraries(hello_xr PRIVATE PkgConfig::PULSE_SIMPLE)
+        target_compile_definitions(hello_xr PRIVATE HAVE_PULSE_SIMPLE)
+    else()
+        message(STATUS "hello_xr: libpulse-simple not found - HELLO_XR_AUDIO will have no effect")
+    endif()
 else()
     message(STATUS "hello_xr: ffmpeg not found - 360 video playback disabled")
 endif()
