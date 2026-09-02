@@ -373,7 +373,9 @@ const char* HelpLine() {
            "enter recentra   n siguiente   p anterior   q salir "
            "(mando WMR: trigger pausa, stick X seek, stick Y zoom, grip recentra, "
            "A/B (der.) brillo, Y (izq.) siguiente, X (izq.) anterior, "
-           "mantener Menu ~1.5s sale)";
+           "mantener Menu ~1.5s sale) "
+           "(mando Xbox, opcional: A pausa, Start recentra, RB siguiente, LB anterior, "
+           "mantener Guide ~1.5s sale)";
 }
 
 }  // namespace PlayerControl

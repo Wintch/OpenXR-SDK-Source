@@ -10,6 +10,7 @@
 #include "graphicsplugin.h"
 #include "openxr_program.h"
 #include "playercontrol.h"
+#include "gamepadinput.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -421,6 +422,12 @@ int main(int argc, char* argv[]) {
             }
         }};
         exitPollingThread.detach();
+
+        // Xbox 360 pad fallback - a second, fully independent input source for the same
+        // core controls (pause/resume, recenter, next/previous track), useful when a VR
+        // controller isn't paired or available (Monado has no runtime controller hotplug on
+        // this rig - see gamepadinput.h). No-op if no such pad is ever plugged in.
+        GamepadInput::Start();
 
         bool requestRestart = false;
         do {

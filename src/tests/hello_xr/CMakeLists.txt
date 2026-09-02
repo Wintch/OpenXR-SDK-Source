@@ -20,6 +20,7 @@ set(LOCAL_HEADERS
     common.h
     d3d_common.h
     d3d12_utils.h
+    gamepadinput.h
     geometry.h
     graphicsapi.h
     graphicsplugin.h
@@ -38,6 +39,7 @@ set(LOCAL_HEADERS
 set(LOCAL_SOURCE
     d3d_common.cpp
     d3d12_utils.cpp
+    gamepadinput.cpp
     graphicsplugin_d3d11.cpp
     graphicsplugin_d3d12.cpp
     graphicsplugin_factory.cpp

@@ -4,7 +4,7 @@
 // consumer sits deep inside the render loop, so the state between them is a small set of
 // atomics rather than a parameter threaded through the graphics plugin interface.
 //
-//   space   pause / resume (also: WMR controller trigger)
+//   space   pause / resume (also: WMR controller trigger; Xbox pad A)
 //   [  ]    slower / faster (1x, 0.5x, 0.25x, 2x ...)
 //   1       back to normal speed
 //   h  l    seek -10s / +10s (also: WMR controller thumbstick X)
@@ -15,10 +15,15 @@
 //   0       back to no zoom (1x)
 //   b  d    brighter / dimmer (also: Touch controller A/B, right hand)
 //   9       back to normal brightness (1x)
-//   enter   recenter forward (also: WMR controller squeeze/grip)
-//   n       next file in the playlist (also: Touch controller Y, left hand)
-//   p       previous file in the playlist (also: Touch controller X, left hand)
-//   q ESC   quit (also: hold the WMR Menu button ~1.5s)
+//   enter   recenter forward (also: WMR controller squeeze/grip; Xbox pad Start)
+//   n       next file in the playlist (also: Touch controller Y, left hand; Xbox pad RB)
+//   p       previous file in the playlist (also: Touch controller X, left hand; Xbox pad LB)
+//   q ESC   quit (also: hold the WMR Menu button ~1.5s; Xbox pad: hold Guide ~1.5s)
+//
+// An Xbox 360 pad (see gamepadinput.h/.cpp) is a third, fully independent producer into
+// this same control surface - a fallback for when a VR controller isn't paired/available,
+// since Monado has no runtime controller hotplug on this rig. Only the controls listed
+// above are wired to it; seek/zoom/brightness have no pad binding yet.
 
 #pragma once
 
