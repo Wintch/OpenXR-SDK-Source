@@ -1531,12 +1531,20 @@ struct OpenXrProgram : IOpenXrProgram {
         // space overseer bakes into every tracking origin -- Stage's Y=0 IS the calibrated
         // real floor already (see docs/08, 2026-09-05 entry, for the full mechanism and why
         // an earlier live-recalibration attempt here was a regression, not a fix).
+        //
+        // floorYForLog: same m_appSpace-relative Y as the head/controller HELLO_XR_POSE_LOG
+        // line just below -- both come from xrLocateSpace/xrLocateViews against the SAME
+        // m_appSpace, so (head.y - floorYForLog) is directly the wearer's real measured eye
+        // height above wherever this grid actually renders. 2026-09-05: added to settle a
+        // live "feels too high" report with a number instead of another guess.
+        float floorYForLog = std::numeric_limits<float>::quiet_NaN();
         if (passthroughMode && m_stageSpaceForFloorGrid != XR_NULL_HANDLE) {
             XrSpaceLocation stageLocation{XR_TYPE_SPACE_LOCATION};
             res = xrLocateSpace(m_stageSpaceForFloorGrid, m_appSpace, predictedDisplayTime, &stageLocation);
             if (XR_UNQUALIFIED_SUCCESS(res) &&
                 (stageLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
                 (stageLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
+                floorYForLog = stageLocation.pose.position.y;
                 PushFloorGrid(cubes, stageLocation.pose);
             }
         }
@@ -1595,9 +1603,10 @@ struct OpenXrProgram : IOpenXrProgram {
                                posValid ? "OK" : "--", posTracked ? "OK" : "--", fx, fy, fz, dir);
                 };
 
-                Log::Write(Log::Level::Info, Fmt("POSE head (%+6.3f %+6.3f %+6.3f) | left %s | right %s", head.x,
-                                                 head.y, head.z, describe(handLocation[Side::LEFT]).c_str(),
-                                                 describe(handLocation[Side::RIGHT]).c_str()));
+                Log::Write(Log::Level::Info,
+                           Fmt("POSE head (%+6.3f %+6.3f %+6.3f) floorY %+6.3f eyeAboveFloor %+6.3f | left %s | right %s",
+                               head.x, head.y, head.z, floorYForLog, head.y - floorYForLog,
+                               describe(handLocation[Side::LEFT]).c_str(), describe(handLocation[Side::RIGHT]).c_str()));
             }
         }
 
