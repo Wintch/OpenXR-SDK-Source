@@ -3,6 +3,8 @@
 #include "logger.h"
 #include "video360.h"
 
+#include <fstream>
+
 #ifndef HAVE_FFMPEG
 
 // Built without ffmpeg: keep the API so graphicsplugin_vulkan.cpp needs no #ifdefs, and let
@@ -487,8 +489,27 @@ struct Video360::Impl {
     // WMR_CAMERA_SNAPSHOT_THROTTLE, ~1 fps today, tuned for the web dashboard - not for this):
     // polling faster costs nothing but the occasional wasted stat() call, and means a future
     // faster dump cadence is picked up without touching this file again.
+    // Reads camera<index>.pgm.ts (docs/08 v0 redraw-latency investigation, 2026-09-05): the
+    // driver-side write timestamp wmr_camera_dump_snapshot_pgm() stamps with os_monotonic_get_ns()
+    // (CLOCK_MONOTONIC), which is machine-wide and safe to diff against our OWN CLOCK_MONOTONIC
+    // read below even though it's a different process -- unlike the device's own HoloLens-tick
+    // timestamps, which are a separate uncalibrated clock domain and would give a meaningless
+    // number here. Missing/unparseable sidecar just means "no reading this tick", never fatal.
+    static bool ReadTimestampSidecar(const std::string& pgmPath, int64_t& outTsNs) {
+        std::ifstream f(pgmPath + ".ts");
+        if (!f) return false;
+        f >> outTsNs;
+        return !f.fail();
+    }
+
     void PollCameraLoop() {
-        constexpr auto kPollInterval = std::chrono::milliseconds(33);  // ~30 Hz mtime check
+        // Was 33ms (~30Hz): capped observed framerate at ~30fps regardless of how fast the
+        // driver actually dumps (docs/08, 2026-09-05 -- the driver-side rate was independently
+        // raised to ~90Hz the same day via WMR_CAMERA_SNAPSHOT_RATE_DIVISOR, but this loop never
+        // looked more often than every 33ms, so it could only ever observe ~30 of those). 4ms
+        // undercuts the ~11ms real dump interval with margin; cost per tick is one stat() call
+        // (microseconds), so this is not a busy-loop concern.
+        constexpr auto kPollInterval = std::chrono::milliseconds(4);
 
         struct timespec lastMtime {
             0, 0
@@ -496,6 +517,8 @@ struct Video360::Impl {
         bool haveFrame = false;
         auto fpsWindowStart = std::chrono::steady_clock::now();
         int framesThisWindow = 0;
+        double staleSumMs = 0.0, staleMinMs = 1e9, staleMaxMs = 0.0;
+        int staleSamples = 0;
 
         while (!quit.load()) {
             struct stat st{};
@@ -518,6 +541,21 @@ struct Video360::Impl {
                             lastMtime = st.st_mtim;
                             haveFrame = true;
                             framesThisWindow++;
+
+                            if (wantStats) {
+                                int64_t writeTsNs = 0;
+                                if (ReadTimestampSidecar(cameraPath, writeTsNs)) {
+                                    struct timespec nowTs {};
+                                    clock_gettime(CLOCK_MONOTONIC, &nowTs);
+                                    const int64_t nowNs =
+                                        (int64_t)nowTs.tv_sec * 1000000000LL + nowTs.tv_nsec;
+                                    const double staleMs = (double)(nowNs - writeTsNs) / 1e6;
+                                    staleSumMs += staleMs;
+                                    staleMinMs = std::min(staleMinMs, staleMs);
+                                    staleMaxMs = std::max(staleMaxMs, staleMs);
+                                    staleSamples++;
+                                }
+                            }
                         }
                     }
                     // A mismatched w/h (a torn read is not possible - see ReadPgmFile's atomic-
@@ -531,7 +569,17 @@ struct Video360::Impl {
             const double windowSecs = std::chrono::duration<double>(now - fpsWindowStart).count();
             if (windowSecs >= 1.0) {
                 measuredFps.store(framesThisWindow / windowSecs, std::memory_order_relaxed);
+                if (wantStats && staleSamples > 0) {
+                    Log::Write(Log::Level::Info,
+                               Fmt("video360: camera pipeline staleness (write-to-poll) over %d samples: "
+                                   "min %.1fms mean %.1fms max %.1fms",
+                                   staleSamples, staleMinMs, staleSumMs / staleSamples, staleMaxMs));
+                }
                 framesThisWindow = 0;
+                staleSumMs = 0.0;
+                staleMinMs = 1e9;
+                staleMaxMs = 0.0;
+                staleSamples = 0;
                 fpsWindowStart = now;
             }
 
@@ -933,6 +981,12 @@ Video360::~Video360() = default;
 
 bool Video360::Open(const std::string& path) {
     Impl& impl = *m_impl;
+
+    // Set once, up front, for BOTH modes below (reverb-g2, 2026-09-05): the camera-mode branch
+    // returns early a few lines down, and used to skip the file-mode-only wantStats assignment
+    // further down in this function entirely -- so HELLO_XR_VIDEO_STATS silently never took
+    // effect in passthrough/camera mode. Harmless to also still be set again for file mode below.
+    impl.wantStats = getenv("HELLO_XR_VIDEO_STATS") != nullptr;
 
     // Camera-feed v0 (docs/08-passthrough-limits.md): a ".pgm" path names a live tracking-
     // camera dump (wmr_camera.c's wmr_camera_dump_snapshot_pgm(), ~/vr/cameraN.pgm), not a
