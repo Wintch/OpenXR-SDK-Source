@@ -2118,91 +2118,122 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             swapchainData->BindCubePipeline(m_cmdBuffer.buf, imageArrayIndex);
             vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
 
-            // Compute the view-projection once; the eye pose is the one already resolved above.
+            // Floor-grid/reference-cube view matrix (reverb-g2, 2026-09-05, docs/08): the grid
+            // must appear to move WITHIN the passthrough video's continuously-updating content
+            // the same way a real, physically-anchored object would as the wearer turns their
+            // head -- not frozen to the screen (574a9cf's regression: "ahora esta completamente
+            // atado al casco, no al piso real") and not desynced from the video's own recenter
+            // handling (the original bug: "el piso gira un poco a su manera, no esta en
+            // sincronia con lo que veo"). That means: real, LIVE head orientation as input (not
+            // frozen), run through the exact SAME screen-mapping the video's own ray-cast uses
+            // -- including its recenter-yaw and digital-zoom handling -- rather than the plain
+            // "world-anchored" view matrix ordinary 360/photo/video cubes use.
             //
-            // Built from `pose` (this eye's pose AFTER the HELLO_XR_FIXED_POSE identity-
-            // orientation override and recenter-yaw above), NOT the raw `layerView.pose` --
-            // reverb-g2, 2026-09-05 (docs/08): a live wearer reported the synthetic floor grid
-            // rotating independently of the passthrough video ("el piso gira un poco a su
-            // manera, no esta en sincronia con lo que veo, mas alla de la altura" -- the
-            // height was separately confirmed correct, see floorYForLog in
-            // openxr_program.cpp). The video's own ray-cast (frag.glsl's `dir`) already treats
-            // this eye's orientation as identity under HELLO_XR_FIXED_POSE -- it never rotates
-            // on screen as the head turns, only its CONTENT changes, because the physical
-            // camera is bolted to the head and already bakes head rotation into the live
-            // frame it captures. This view matrix, still built from the REAL, live-tracked
-            // `layerView.pose.orientation`, was rotating every cube the ordinary
-            // "world-anchored" way instead -- correct for normal VR content, but a different
-            // convention than the video's. In passthrough mode the cubes vector is only ever
-            // the floor grid (controller/reference cubes are suppressed at the source, see
-            // above), so that mismatch was exactly the grid visibly swimming against the
-            // video the wearer described.
+            // Derivation (see docs/08 for the full derivation, condensed here): the video's
+            // fragment shader (frag.glsl) takes each display pixel's own native ray tangent
+            // (xv,yv) [from layerView.fov, via fovTangents], rotates it into `dir = viewRotation
+            // * (xv,yv,-1)` (viewRotation = CreateFromQuaternion(pose.orientation); pose.
+            // orientation is recenter-yaw composed onto an IDENTITY base under
+            // HELLO_XR_FIXED_POSE -- see the `pose` block above), re-tangents it as
+            // `screen = dir.xy / -dir.z`, divides by digital zoom, and treats the result as a
+            // real camera-relative ray for Cam0Distort's raw-pixel lookup. So: display pixel
+            // (xv,yv) always shows whatever is CURRENTLY at camera-relative tangent `screen` --
+            // the live camera frame does the real-orientation tracking implicitly (a fresh frame
+            // each instant, relative to the camera's own true current pose), so the software
+            // must NOT apply any additional real-orientation rotation on top for the video path
+            // -- that's why `pose.orientation` is frozen there, on purpose.
             //
-            // Substituting `pose` fixes that at the one place both paths share. Outside
-            // HELLO_XR_FIXED_POSE (and with no recenter pending) `pose` is byte-identical to
-            // `layerView.pose` (see where it's built, above), so this is a no-op for every
-            // other mode/sample this renderer draws -- ordinary 360/photo/video cubes (the
-            // controller and reference-space gizmos) keep rotating the normal, correct,
-            // world-anchored way. Under HELLO_XR_FIXED_POSE, `pose.orientation` is instead a
-            // frame-to-frame CONSTANT (identity, or whatever fixed yaw the last recenter set)
-            // -- independent of the real head orientation -- so `view`'s rotation component
-            // below becomes that same constant every frame, and the floor grid's screen
-            // position stops tracking live head orientation entirely, the same way the
-            // video's own screen mapping already doesn't. Position is untouched by either
-            // override (`pose.position` always equals `layerView.pose.position`), and this
-            // build pins it at (0,0,0) in 3DOF mode anyway (see docs/08) -- this fix is about
-            // orientation only, exactly like the video's own override.
+            // A SYNTHETIC point (the grid) has no live camera frame doing that implicit
+            // re-sampling -- it has to be explicitly re-projected every frame instead. Inverting
+            // the video's mapping above (solve for the NDC position at which a real object at
+            // this point's TRUE current camera-relative tangent would be shown): transform the
+            // point into the REAL, live view frame first (Q_real = layerView.pose.orientation,
+            // NOT frozen), scale the resulting x/y by the digital-zoom factor (matching frag.
+            // glsl's `screen /= zoom`, applied to the real un-recentered ray), and ONLY THEN
+            // apply the recenter rotation's INVERSE on the outside. These three stages have to
+            // stay as separate matrix multiplies, in that order -- collapsing them into a single
+            // "gridOrient = Q_real composed with the recenter yaw, then invert the whole rigid
+            // body" quaternion shortcut (this project's first draft of this fix) LOOKS
+            // equivalent, and even matches this file's own recenter-composition pattern for
+            // `pose.orientation` above, but is only actually equivalent when Q_real has zero
+            // pitch/roll (pure yaw). Checked numerically (see the verification script): it
+            // measurably diverges whenever the wearer's real head has any pitch/roll AND a
+            // recenter is active -- i.e. almost every real session after the first recenter
+            // press. Kept as three explicit stages below specifically to avoid that.
             //
-            // Explicitly re-gated on HELLO_XR_FIXED_POSE here (rather than trusting `pose` to
-            // simply equal `layerView.pose` whenever it's unset): the recenter-yaw block above
-            // is NOT itself gated on HELLO_XR_FIXED_POSE, so a recenter pressed while watching
-            // an ordinary 360/180 video (no passthrough, cubes possibly still visible) would
-            // otherwise now also yaw the cube view, which nothing but this floor-grid bug asked
-            // for. Keeping `useFrozenCubeView` scoped this tightly means the ONLY observable
-            // change from this fix is: passthrough mode's floor grid stops tracking live head
-            // orientation. Every other mode/sample this renderer draws is untouched, byte-for-
-            // byte, same as before this fix (matches this file's own established convention --
-            // see HELLO_XR_GPU_LOAD and HELLO_XR_PASSTHROUGH_FISHEYE_CORRECT above, both gated
-            // the same deliberate way).
-            const bool useFrozenCubeView = (getenv("HELLO_XR_FIXED_POSE") != nullptr);
-            const XrVector3f& cubeViewPos = useFrozenCubeView ? pose.position : layerView.pose.position;
-            const XrQuaternionf& cubeViewOrient = useFrozenCubeView ? pose.orientation : layerView.pose.orientation;
+            // Position is untouched either way (`layerView.pose.position`, real, always was --
+            // recenter/zoom are orientation/content-only here, matching the video's own "skybox
+            // at infinity" treatment of position for the FLAT/passthrough path). Not gated on
+            // HELLO_XR_FIXED_POSE: recenter-yaw and zoom are already read unconditionally for
+            // the video path itself, and this construction reduces to the plain real-orientation
+            // view matrix (byte-equivalent to the pre-574a9cf, pre-this-fix `layerView.pose`-
+            // based matrix) whenever recenterYaw == 0 and zoom == 1 -- i.e. every ordinary
+            // 360/180/photo/video session that never touches recenter or zoom is unaffected.
             XrMatrix4x4f proj;
             XrMatrix4x4f_CreateProjectionFov(&proj, GRAPHICS_VULKAN, layerView.fov, 0.05f, 100.0f);
-            XrMatrix4x4f toView;
-            XrVector3f identityScale{1.f, 1.f, 1.f};
-            XrMatrix4x4f_CreateTranslationRotationScale(&toView, &cubeViewPos, &cubeViewOrient, &identityScale);
-            XrMatrix4x4f view;
-            XrMatrix4x4f_InvertRigidBody(&view, &toView);
-            XrMatrix4x4f vp;
-            XrMatrix4x4f_Multiply(&vp, &proj, &view);
 
-            // Self-verification for the fix above, without needing anyone to wear the headset
-            // (this project's standing rule, see feedback_minimize_wearer_test_iterations):
-            // once a second, print the REAL live head/eye orientation next to the one actually
-            // fed to `view` above (`pose.orientation`, now frame-to-frame constant under
-            // HELLO_XR_FIXED_POSE) and where the grid's own first cube lands in NDC. If the
-            // fix is working, realHeadQ should visibly change as the wearer turns their head
-            // (or as HELLO_XR_POSE_STATS/manual head motion is exercised) while usedViewQ and
-            // the cube's NDC position stay constant -- the grid no longer moves on screen at
-            // all as the head rotates, matching the video's own frozen screen mapping. Eye 0
-            // only (RenderView runs once per eye; one line a second is enough).
-            if (eye == 0 && useFrozenCubeView && !cubes.empty()) {
+            XrVector3f identityScale{1.f, 1.f, 1.f};
+            XrMatrix4x4f toRealView;
+            XrMatrix4x4f_CreateTranslationRotationScale(&toRealView, &layerView.pose.position, &layerView.pose.orientation,
+                                                        &identityScale);
+            XrMatrix4x4f gridView;
+            XrMatrix4x4f_InvertRigidBody(&gridView, &toRealView);  // world -> real, live view space
+
+            // Digital zoom: scale x/y in the real (un-recentered) view frame -- BEFORE the
+            // recenter rotation below, not after (see derivation above). Same floor as the
+            // shader's own `max(panoFov.z, 0.01)` so a runaway zoom-out can't blow this up.
+            const float zoomClamped = std::max((float)PlayerControl::Zoom(), 0.01f);
+            if (zoomClamped != 1.0f) {
+                gridView.m[0] *= zoomClamped;
+                gridView.m[4] *= zoomClamped;
+                gridView.m[8] *= zoomClamped;
+                gridView.m[12] *= zoomClamped;
+                gridView.m[1] *= zoomClamped;
+                gridView.m[5] *= zoomClamped;
+                gridView.m[9] *= zoomClamped;
+                gridView.m[13] *= zoomClamped;
+            }
+
+            // Recenter: rotate on the OUTSIDE by the exact inverse of the yaw `pose.orientation`
+            // applies above (that one composes -recenterYaw around Y onto its base; the correct
+            // view-space correction is that composition's inverse, +recenterYaw around Y,
+            // applied last/outermost -- see derivation above).
+            if (recenterYaw != 0.0) {
+                XrVector3f yAxis{0.0f, 1.0f, 0.0f};
+                XrQuaternionf recenterInv;
+                XrQuaternionf_CreateFromAxisAngle(&recenterInv, &yAxis, (float)recenterYaw);
+                XrMatrix4x4f recenterInvMat;
+                XrMatrix4x4f_CreateFromQuaternion(&recenterInvMat, &recenterInv);
+                XrMatrix4x4f rotated;
+                XrMatrix4x4f_Multiply(&rotated, &recenterInvMat, &gridView);
+                gridView = rotated;
+            }
+
+            XrMatrix4x4f vp;
+            XrMatrix4x4f_Multiply(&vp, &proj, &gridView);
+
+            // Self-verification instrument for the fix above, without needing anyone to wear the
+            // headset (this project's standing rule, see
+            // feedback_minimize_wearer_test_iterations): once a second, print the real head
+            // orientation, the active recenter yaw/zoom, and where the grid's own first cube
+            // lands in NDC. If the fix is working, cube0's NDC should visibly change as realHeadQ
+            // changes (unlike the frozen-view regression, where it never moved) while staying
+            // bounded/finite (unlike the original swim bug, where it reached >1e15).
+            if (eye == 0 && getenv("HELLO_XR_FIXED_POSE") && !cubes.empty()) {
                 static std::chrono::steady_clock::time_point lastFloorGridLog{};
                 const auto floorGridLogNow = std::chrono::steady_clock::now();
                 if (floorGridLogNow - lastFloorGridLog >= std::chrono::seconds(1)) {
                     lastFloorGridLog = floorGridLogNow;
                     const XrQuaternionf& realQ = layerView.pose.orientation;
-                    const XrQuaternionf& usedQ = cubeViewOrient;
                     const XrVector4f cube0World{cubes[0].Pose.position.x, cubes[0].Pose.position.y,
                                                 cubes[0].Pose.position.z, 1.0f};
                     XrVector4f cube0Clip;
                     XrMatrix4x4f_TransformVector4f(&cube0Clip, &vp, &cube0World);
                     Log::Write(
                         Log::Level::Info,
-                        Fmt("floorgrid: realHeadQ(%+.3f %+.3f %+.3f %+.3f) usedViewQ(%+.3f %+.3f %+.3f %+.3f) "
+                        Fmt("floorgrid: realHeadQ(%+.3f %+.3f %+.3f %+.3f) recenterYaw(%+.3f) zoom(%.3f) "
                             "cube0 ndc(%+.3f %+.3f)",
-                            realQ.x, realQ.y, realQ.z, realQ.w, usedQ.x, usedQ.y, usedQ.z, usedQ.w,
+                            realQ.x, realQ.y, realQ.z, realQ.w, recenterYaw, zoomClamped,
                             cube0Clip.x / cube0Clip.w, cube0Clip.y / cube0Clip.w));
                 }
             }
