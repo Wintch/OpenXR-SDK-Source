@@ -2057,7 +2057,15 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // whole screen and a stray controller/reference-space cube drawn on top would be
         // exactly the kind of world geometry those modes exist to rule out. Counter mode is
         // left alone - it's a small additive overlay on otherwise-normal content, cubes and all.
-        const bool suppressCubesForTestPattern = (testPattern == TestPattern::Toggle || testPattern == TestPattern::Card);
+        // Also suppressed for HELLO_XR_FIXED_POSE (reverb-g2, 2026-09-05, docs/08 passthrough
+        // v0): that flag means this is a live camera-passthrough view, not the ordinary 360/flat
+        // video use case the cubes above were written for -- a wearer reported the controller
+        // cubes z-fighting against the live camera image (both drawn as opaque geometry at
+        // similar apparent depth). The controller-tracking instrument these cubes provide is
+        // moot for a raw passthrough demo anyway.
+        const bool suppressCubesForPassthrough = getenv("HELLO_XR_FIXED_POSE") != nullptr;
+        const bool suppressCubesForTestPattern =
+            (testPattern == TestPattern::Toggle || testPattern == TestPattern::Card) || suppressCubesForPassthrough;
         if (!cubes.empty() && !suppressCubesForTestPattern) {
             swapchainData->BindCubePipeline(m_cmdBuffer.buf, imageArrayIndex);
             vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);
