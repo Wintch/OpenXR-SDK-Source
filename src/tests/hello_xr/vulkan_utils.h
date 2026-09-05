@@ -947,8 +947,15 @@ struct VulkanUniformBuffer {
                                // screen; bit 4 = eye; bits 5-6 = HELLO_XR_TEST_PATTERN (0 off,
                                // 1 toggle, 2 card, 3 counter - see graphicsplugin_vulkan.cpp
                                // and frag.glsl); bits 7-14/15-16 = counter mode's frame count /
-                               // color phase, unused otherwise. y/z/w: progress bar and
-                               // quit-hold fields (frag.glsl), reused by card/toggle mode.
+                               // color phase, unused otherwise; bits 17-23 = HELLO_XR_GPU_LOAD
+                               // percentage (0-100, always applied regardless of
+                               // HELLO_XR_TEST_PATTERN - see GpuLoadPerturb in frag.glsl); bit
+                               // 24 = HELLO_XR_PASSTHROUGH_FISHEYE_CORRECT (only ever set for
+                               // real PROJ_FLAT camera-passthrough content under
+                               // HELLO_XR_FIXED_POSE - see graphicsplugin_vulkan.cpp and
+                               // frag.glsl's Cam0Distort).
+                               // y/z/w: progress bar and quit-hold fields (frag.glsl), reused
+                               // by card/toggle mode.
 };
 
 // Simple vertex MVP xform, tint color & color fragment shader layout

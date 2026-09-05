@@ -21,8 +21,14 @@ layout (std140, push_constant) uniform buf
     vec4 panoFov;         // 180: half-angles in radians. flat: half-extents of the screen.
     ivec4 mode;           // x: PROJ_* in bits 0-3, eye in bit 4, HELLO_XR_TEST_PATTERN in
                            // bits 5-6 (see below), counter-mode frame count/phase in bits
-                           // 7-14/15-16. y/z/w: progress bar and quit-hold, see near the
-                           // bottom of this file (also reused by card/toggle test patterns).
+                           // 7-14/15-16, HELLO_XR_GPU_LOAD percentage (0-100) in bits 17-23
+                           // (see GpuLoadPerturb below - always present, independent of
+                           // HELLO_XR_TEST_PATTERN), HELLO_XR_PASSTHROUGH_FISHEYE_CORRECT in
+                           // bit 24 (see Cam0Distort below - only ever set for real PROJ_FLAT
+                           // camera-passthrough content, never test patterns or ordinary
+                           // pano/photo/video). y/z/w: progress bar and quit-hold, see
+                           // near the bottom of this file (also reused by card/toggle test
+                           // patterns).
 } ubuf;
 
 layout (set = 0, binding = 0) uniform sampler2D equirectTex;
@@ -39,6 +45,69 @@ layout (location = 0) out vec4 FragColor;
 float SrgbToLinear(float c)
 {
     return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+// HELLO_XR_PASSTHROUGH_FISHEYE_CORRECT (docs/08, 2026-09-05): a live wearer asked for the raw
+// camera-passthrough view's fisheye barrel distortion to be corrected so straight real-world
+// lines (door frames, wall edges) look straight, the way they actually look to the eye. cam0's
+// raw frame was being shown with a plain linear/pinhole UV mapping and no distortion
+// correction at all (correct for ordinary rectilinear video/photos, wrong for a fisheye lens).
+//
+// cam0's calibration (~/vr/camera-calibration.json on the lab rig) is Basalt's "fisheye624"
+// model - confirmed from Basalt's own source, not assumed from the coefficient names:
+// basalt/thirdparty/basalt-headers/include/basalt/camera/fisheye624_camera.hpp. It is a
+// Kannala-Brandt equidistant radial term (theta = atan(r), distorted by an order-12 odd
+// polynomial in theta with coefficients k1..k6) plus a Brown-Conrady tangential term (p1, p2).
+// The model also supports a "thin prism" term (s1..s4); cam0's calibration doesn't carry those
+// coefficients (equivalent to 0), so they're omitted below. This mirrors that header's
+// distort() function (the analytic FORWARD direction: undistorted normalized ray -> raw pixel)
+// term for term - forward Kannala-Brandt distortion is a closed-form polynomial, but its
+// inverse generally isn't, so rather than trying to undistort the source image, every output
+// pixel's already-rectilinear ray is distorted forward to find where it lands in the raw
+// fisheye source and sampled there ("distort the sample coordinate, not the image").
+//
+// Baked as shader constants rather than plumbed through the push-constant buffer: that struct
+// is already at Vulkan's guaranteed 128-byte push-constant limit (see vulkan_utils.h /
+// graphicsplugin_vulkan.cpp), and this passthrough viewer only ever reads cam0 (camera0.pgm) -
+// its intrinsics don't change at runtime. A second live camera would need a real uniform
+// buffer instead of more constants here.
+const float kCam0Fx = 270.848579;
+const float kCam0Fy = 270.904999;
+const float kCam0Cx = 324.454842;
+const float kCam0Cy = 242.324553;
+const float kCam0ImgW = 640.0;
+const float kCam0ImgH = 480.0;
+const float kCam0K1 = 0.447793;
+const float kCam0K2 = 0.359404;
+const float kCam0K3 = 0.008073;
+const float kCam0K4 = 0.710360;
+const float kCam0K5 = 0.393890;
+const float kCam0K6 = 0.062225;
+const float kCam0P1 = -0.000176;
+const float kCam0P2 = 0.000239;
+
+// xy: an UNDISTORTED normalized ray in Basalt/OpenCV camera convention (x right, y DOWN,
+// z forward) - i.e. (X/Z, Y/Z) for a point along that ray. Returns the raw fisheye pixel
+// coordinate (in cam0's 640x480 pixel space) that ray actually lands on through the real lens.
+vec2 Cam0Distort(vec2 xy)
+{
+    float rp = length(xy);
+    if (rp < 1e-8) {
+        // On-axis: theta is 0 and cos/sin(phi) are undefined, but the distorted point is just
+        // the principal point regardless (every term above is proportional to theta or rp).
+        return vec2(kCam0Cx, kCam0Cy);
+    }
+    float th = atan(rp);
+    float th2 = th * th;
+    // theta * (1 + k1*th^2 + k2*th^4 + ... + k6*th^12), Horner form - matches the header
+    // exactly (see distort()'s theta_dist).
+    float thetaDist = th * (1.0 + th2 * (kCam0K1 + th2 * (kCam0K2 + th2 * (kCam0K3 + th2 * (kCam0K4 + th2 * (kCam0K5 + th2 * kCam0K6))))));
+    vec2 r = (thetaDist / rp) * xy;  // xr, yr: distorted radial coordinate
+    float rd2 = dot(r, r);
+    vec2 tangential = vec2((2.0 * r.x * r.x + rd2) * kCam0P1 + 2.0 * r.x * r.y * kCam0P2,
+                           (2.0 * r.y * r.y + rd2) * kCam0P2 + 2.0 * r.x * r.y * kCam0P1);
+    vec2 pp = r + tangential;
+    return vec2(kCam0Fx * pp.x + kCam0Cx, kCam0Fy * pp.y + kCam0Cy);
 }
 
 // HELLO_XR_TEST_PATTERN=card (see graphicsplugin_vulkan.cpp): thin white border + checkerboard
@@ -112,6 +181,48 @@ bool CounterPatch(float s, float t, int modeX)
     return true;
 }
 
+// HELLO_XR_GPU_LOAD (see graphicsplugin_vulkan.cpp): synthetic per-fragment busy work for
+// sweeping GPU utilization against VR frame pacing with no real game driving the GPU -
+// scripts/gpu-load-sweep.sh in the lab's reverb-g2 repo is what launches this. mode.x bits
+// 17-23 carry the requested load as the literal 0-100 percentage parsed from the env var (see
+// the .cpp for why it's not pre-multiplied into an iteration count there) - kGpuLoadItersPerPercent
+// below is the ONLY calibration knob, so retuning for a different GPU/resolution never needs a
+// pipeline rebuild, just a different HELLO_XR_GPU_LOAD value at the next launch.
+//
+// The loop bound is a runtime value (read out of a push constant, not a compile-time literal),
+// so the compiler cannot unroll or hoist it away, and the accumulated hash feeds directly into
+// the caller's FragColor - it cannot be dead-code-eliminated either. Each iteration is one
+// sin() plus a fused multiply-add: sin/cos route through the SFU on NVIDIA parts, at a
+// fraction of the core FMA rate, so this is deliberately more expensive per iteration than
+// plain arithmetic - "thousands of FMAs" worth of shader-core-equivalent cost without needing
+// an equally huge iteration count. The result is scaled by 1e-9 before being handed back, so
+// it perturbs the caller's color imperceptibly: HELLO_XR_GPU_LOAD=0 gives iterations=0,
+// acc=0.0, and FragColor + vec3(0.0) is bit-exact - see the .cpp for the "unset is
+// byte-identical" rule this project holds every HELLO_XR_* option to.
+//
+// Calibration (rough, per the project's own brief - measure with gpu-load-sweep.sh, don't
+// trust this as exact): kGpuLoadItersPerPercent=40 puts HELLO_XR_GPU_LOAD=100 at 4000
+// sin+FMA iterations per fragment. At 4320x2160@90 stereo (the G2's native mode) that's
+// expected to bring an RTX 3060 Ti close to saturation; retune this constant against a real
+// pacing sweep rather than assuming the number holds on other GPUs or resolutions.
+const int kGpuLoadItersPerPercent = 40;
+vec3 GpuLoadPerturb(int modeX, vec2 fragXy)
+{
+    int loadPct = (modeX >> 17) & 0x7F;
+    int iterations = loadPct * kGpuLoadItersPerPercent;
+
+    // Seed from screen position: keeps the compiler from treating the loop as fragment-
+    // invariant (which could let it hoist/cache the result once for the whole draw), and
+    // keeps neighboring fragments from all walking the identical hash trajectory.
+    float h = fragXy.x * 12.9898 + fragXy.y * 78.233;
+    float acc = 0.0;
+    for (int i = 0; i < iterations; ++i) {
+        h = fract(sin(h) * 43758.5453);
+        acc = fma(h, h, acc - h * 0.5);
+    }
+    return vec3(acc) * 1e-9;
+}
+
 void main()
 {
     // Vulkan NDC: x runs -1 (left) .. +1 (right), y runs -1 (top) .. +1 (bottom).
@@ -130,6 +241,7 @@ void main()
     // that slot is unused by this mode, reused instead of growing the push-constant struct).
     if (testPattern == 1) {
         FragColor = vec4(ubuf.fovTangents.rgb, 1.0);
+        FragColor.rgb += GpuLoadPerturb(ubuf.mode.x, gl_FragCoord.xy);
         return;
     }
 
@@ -137,6 +249,7 @@ void main()
     // it never needs any of it, and must win over the `discard` below for pixels outside the
     // loaded content - easiest to guarantee by simply returning before reaching that check.
     if (testPattern == 3 && CounterPatch(s, t, ubuf.mode.x)) {
+        FragColor.rgb += GpuLoadPerturb(ubuf.mode.x, gl_FragCoord.xy);
         return;
     }
 
@@ -169,6 +282,25 @@ void main()
         screen /= zoom;
         uv = screen / vec2(ubuf.panoFov.x, -ubuf.panoFov.y) * 0.5 + 0.5;
         inside = (depth > 0.0 && all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) ? 1.0 : 0.0;
+
+        // HELLO_XR_PASSTHROUGH_FISHEYE_CORRECT (see Cam0Distort above): `screen` is already
+        // exactly (X/Z, Y/Z) for this output pixel's ray - the undistorted normalized
+        // coordinate Cam0Distort expects - just in this shader's view-space convention (+Y
+        // up). Flip Y to Basalt's convention (+Y down, same flip the panoFov.y negation above
+        // already applies going the other way), forward-distort it to find cam0's raw fisheye
+        // pixel, and sample there instead of at the plain linear `uv`. `inside` above still
+        // gates on the requested virtual screen's extent (panoFov, e.g. HELLO_XR_SCREEN_FOV);
+        // AND it with the raw sample landing inside cam0's actual 640x480 frame too, so corners
+        // the fisheye lens doesn't actually cover (possible once corrected to a wide rectilinear
+        // FOV) go black instead of smearing the source's edge pixels.
+        if (((ubuf.mode.x >> 24) & 0x1) != 0) {
+            vec2 rawPixel = Cam0Distort(vec2(screen.x, -screen.y));
+            vec2 uvRaw = rawPixel / vec2(kCam0ImgW, kCam0ImgH);
+            inside = (inside > 0.5 && all(greaterThanEqual(uvRaw, vec2(0.0))) && all(lessThanEqual(uvRaw, vec2(1.0))))
+                         ? 1.0
+                         : 0.0;
+            uv = uvRaw;
+        }
     } else {
         // Equirectangular: horizontal angle -> u, vertical angle -> v.
         float az = atan(dir.x, -dir.z) / zoom;            // 0 straight ahead, +/-PI behind
@@ -191,6 +323,7 @@ void main()
     // screen, inside the quad or not, instead of discarding - see CardColor above.
     if (testPattern == 2) {
         FragColor = vec4(CardColor(uv, inside), 1.0);
+        FragColor.rgb += GpuLoadPerturb(ubuf.mode.x, gl_FragCoord.xy);
         return;
     }
 
@@ -284,4 +417,11 @@ void main()
         vec3 quitColor = vec3(1.0, 0.25, 0.15);
         FragColor.rgb = mix(FragColor.rgb, quitColor, 0.9);
     }
+
+    // HELLO_XR_GPU_LOAD: see GpuLoadPerturb above. Applied last so it never interacts with the
+    // progress/quit-hold blending above (imperceptible either way, but this keeps the ordering
+    // obviously irrelevant instead of relying on the perturbation being too small to matter).
+    // Note this also runs on the `discard`ed path above (nothing there returns), which is fine
+    // - a discarded fragment never reaches the framebuffer regardless of what FragColor holds.
+    FragColor.rgb += GpuLoadPerturb(ubuf.mode.x, gl_FragCoord.xy);
 }

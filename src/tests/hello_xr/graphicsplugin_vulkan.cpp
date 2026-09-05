@@ -1813,6 +1813,27 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
             }
         }
 
+        // HELLO_XR_GPU_LOAD=<0-100>: synthetic fragment-shader busy load, for sweeping GPU
+        // utilization against VR frame pacing with no game driving the GPU (see
+        // scripts/gpu-load-sweep.sh in the lab's reverb-g2 repo, and NEXT-STEP.md's tooling
+        // queue item (a)). Independent of HELLO_XR_TEST_PATTERN above - applies to ordinary
+        // photo/video rendering too, since the sweep wants pacing under real content, not only
+        // synthetic patterns. Parsed every call, same not-cached convention as every other
+        // HELLO_XR_* option here. The value carried through to the shader is the literal
+        // percentage, not a precomputed iteration count - see GpuLoadPerturb in frag.glsl for
+        // the one calibration constant (kGpuLoadItersPerPercent) that turns it into real work,
+        // so retuning for a different GPU never needs a shader recompile.
+        int gpuLoadPct = 0;
+        if (const char* v = getenv("HELLO_XR_GPU_LOAD")) {
+            const int parsed = atoi(v);
+            if (parsed >= 0 && parsed <= 100) {
+                gpuLoadPct = parsed;
+            } else {
+                Log::Write(Log::Level::Warning,
+                           Fmt("HELLO_XR_GPU_LOAD='%s' not an integer in 0-100 - ignoring", v));
+            }
+        }
+
         VulkanSwapchainImageData* swapchainData;
         uint32_t imageIndex;
 
@@ -1958,6 +1979,29 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // Bit 0x10 alongside PROJ_* in the low nibble: which eye this is, for frag.glsl's
         // overlay-bar parallax (see there). Spare bits in an int that only ever needed 0/1/2.
         if (eye == 1) pushConstants.mode[0] |= 0x10;
+
+        // HELLO_XR_PASSTHROUGH_FISHEYE_CORRECT (docs/08, 2026-09-05): a live wearer asked for
+        // the raw camera-passthrough view's fisheye barrel distortion to be corrected so
+        // straight real-world lines (door frames, wall edges) look straight, matching what the
+        // eye actually sees. Only ever meaningful for the live camera feed (PROJ_FLAT showing
+        // cam0's raw fisheye frame under HELLO_XR_FIXED_POSE) - never for ordinary pano/photo/
+        // video content, which was already captured through a normal rectilinear lens, so this
+        // is gated on HELLO_XR_FIXED_POSE and defaults OFF otherwise. Bit 24 is the first one
+        // HELLO_XR_TEST_PATTERN/HELLO_XR_GPU_LOAD's bit ranges (0-23, see below) don't touch.
+        // Set here, before the HELLO_XR_TEST_PATTERN override block below, which reassigns
+        // mode[0] wholesale for Card/Toggle (Counter only ORs extra bits on top, so this
+        // survives that one) - synthetic test patterns are never real camera content, so they
+        // naturally lose this bit again without needing their own exclusion check.
+        if (m_panoLayout.projection == PanoProjection::Flat && getenv("HELLO_XR_FIXED_POSE")) {
+            bool fisheyeCorrect = true;  // default on for passthrough
+            if (const char* v = getenv("HELLO_XR_PASSTHROUGH_FISHEYE_CORRECT")) {
+                fisheyeCorrect = atoi(v) != 0;
+            }
+            if (fisheyeCorrect) {
+                pushConstants.mode[0] |= (1 << 24);
+            }
+        }
+
         // Progress bar (see frag.glsl): mode.y is fill fraction *1000, mode.z is visibility
         // alpha *255. Only shown for a few seconds after the last transport-control touch, so
         // it doesn't sit on screen the whole time someone is just watching.
@@ -2029,6 +2073,13 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
                     break;
             }
         }
+
+        // HELLO_XR_GPU_LOAD bits: applied LAST, after any HELLO_XR_TEST_PATTERN override above
+        // - Toggle/Card reassign mode.x wholesale there (not |=), so setting this any earlier
+        // would just get clobbered. Bits 17-23 are the first ones the TEST_PATTERN encoding
+        // doesn't touch (it uses bits 0-16, see vulkan_utils.h); 7 bits covers the full 0-100
+        // this env var accepts.
+        pushConstants.mode[0] |= (gpuLoadPct & 0x7F) << 17;
 
         vkCmdPushConstants(m_cmdBuffer.buf, m_pipelineLayout.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(pushConstants), &pushConstants);
