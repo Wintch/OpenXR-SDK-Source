@@ -40,9 +40,11 @@ int Video360::AcquireCurrentSlot() { return -1; }
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <sys/stat.h>
 #include <thread>
 #include <vector>
 
@@ -123,6 +125,36 @@ const AVCodec* PickHwCapableDecoder(AVCodecID id, const AVCodec* fallback) {
     }
     return fallback;
 }
+
+// Reads a whole binary-grayscale PGM (P5) file: reverb-g2's camera-feed v0 (docs/08) reuses
+// this to poll wmr_camera.c's dashboard snapshots (~/vr/cameraN.pgm) directly, with no ffmpeg
+// demux/decode involved. The writer (wmr_camera_dump_snapshot_pgm() in wmr_camera.c) always
+// emits the plain "P5\n%u %u\n255\n" header this expects - no comments, no other maxval.
+bool ReadPgmFile(const std::string& path, int& outWidth, int& outHeight, std::vector<uint8_t>& outPixels) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+
+    char magic[3] = {0};
+    int w = 0, h = 0, maxval = 0;
+    // fscanf's %d/%s skip leading whitespace (including the newlines between header tokens)
+    // for us; it stops right after "255", so exactly one separator byte (the '\n' the writer
+    // put there) remains before the binary payload.
+    const bool headerOk = fscanf(f, "%2s %d %d %d", magic, &w, &h, &maxval) == 4;
+    if (!headerOk || std::string(magic) != "P5" || maxval != 255 || w <= 0 || h <= 0) {
+        fclose(f);
+        return false;
+    }
+    fgetc(f);  // the single whitespace byte separating the header from the pixel data
+
+    outPixels.resize((size_t)w * (size_t)h);
+    const size_t got = fread(outPixels.data(), 1, outPixels.size(), f);
+    fclose(f);
+    if (got != outPixels.size()) return false;
+
+    outWidth = w;
+    outHeight = h;
+    return true;
+}
 }  // namespace
 
 struct Video360::Impl {
@@ -156,6 +188,14 @@ struct Video360::Impl {
 
     std::vector<Video360Buffer> buffers;
     std::vector<uint8_t> rowScratch;  // see NormalizeToNv12
+
+    // ---- Camera-feed v0 (docs/08-passthrough-limits.md) ----
+    // Set in Open() when the path ends in ".pgm". No ffmpeg/AVFormatContext/AVCodecContext is
+    // ever touched in this mode - PollCameraLoop() replaces DecodeLoop() entirely, reusing only
+    // the buffer/queue/slot bookkeeping the two modes have in common.
+    bool cameraMode{false};
+    std::string cameraPath;
+    std::atomic<double> measuredFps{0.0};  // what PollCameraLoop() actually sustains, not a guess
 
     std::thread thread;
     std::mutex mutex;
@@ -429,6 +469,75 @@ struct Video360::Impl {
         statDecodeMs = statWriteMs = 0.0;
         statStalls = 0;
         statWindow = now;
+    }
+
+    // Camera-feed v0's decode thread substitute: no decoding at all, just polling. Every
+    // `kPollInterval`, stat() the PGM path; on a changed mtime, read it whole and hand its raw
+    // 8-bit grayscale bytes to the renderer as NV12 Y (byte-for-byte - a PGM P5 row already IS a
+    // tightly packed 8-bit luma row) with UV pinned to neutral (0x80): the sensor is
+    // monochrome, so there is no chroma to synthesize, and centered-zero chroma makes the
+    // shared YUV->RGB shader output R=G=B=Y regardless of which color matrix it assumes.
+    //
+    // Queued pts is always 0.0: there is no independent playback clock to line frames up
+    // against here, a frame is simply "due" the instant it lands. AcquireCurrentSlot()'s
+    // existing "drain every queued frame whose pts has passed" loop already does exactly the
+    // right thing with that - it always ends up showing the newest frame available.
+    //
+    // Poll cadence is decoupled from the dump's own throttle on purpose (wmr_camera.c's
+    // WMR_CAMERA_SNAPSHOT_THROTTLE, ~1 fps today, tuned for the web dashboard - not for this):
+    // polling faster costs nothing but the occasional wasted stat() call, and means a future
+    // faster dump cadence is picked up without touching this file again.
+    void PollCameraLoop() {
+        constexpr auto kPollInterval = std::chrono::milliseconds(33);  // ~30 Hz mtime check
+
+        struct timespec lastMtime {
+            0, 0
+        };
+        bool haveFrame = false;
+        auto fpsWindowStart = std::chrono::steady_clock::now();
+        int framesThisWindow = 0;
+
+        while (!quit.load()) {
+            struct stat st{};
+            if (stat(cameraPath.c_str(), &st) == 0) {
+                const bool changed = !haveFrame || st.st_mtim.tv_sec != lastMtime.tv_sec ||
+                                     st.st_mtim.tv_nsec != lastMtime.tv_nsec;
+                if (changed) {
+                    int w = 0, h = 0;
+                    std::vector<uint8_t> pixels;
+                    if (ReadPgmFile(cameraPath, w, h, pixels) && w == width && h == height) {
+                        const int slot = TakeFreeSlot();
+                        if (slot >= 0) {
+                            memcpy(buffers[slot].y, pixels.data(), YBytes());
+                            memset(buffers[slot].uv, 0x80, UVBytes());
+                            {
+                                std::lock_guard<std::mutex> lock(mutex);
+                                queue.push_back(QueuedFrame{slot, 0.0});
+                                finalPts = 0.0;
+                            }
+                            lastMtime = st.st_mtim;
+                            haveFrame = true;
+                            framesThisWindow++;
+                        }
+                    }
+                    // A mismatched w/h (a torn read is not possible - see ReadPgmFile's atomic-
+                    // rename note in Open() - but a stale dump from a different session could in
+                    // principle differ) or an unreadable file just means "nothing new this
+                    // tick"; best-effort, matching wmr_camera_dump_snapshot_pgm()'s own stance.
+                }
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const double windowSecs = std::chrono::duration<double>(now - fpsWindowStart).count();
+            if (windowSecs >= 1.0) {
+                measuredFps.store(framesThisWindow / windowSecs, std::memory_order_relaxed);
+                framesThisWindow = 0;
+                fpsWindowStart = now;
+            }
+
+            std::this_thread::sleep_for(kPollInterval);
+        }
+        decodeDone = true;
     }
 
     void DecodeLoop() {
@@ -825,6 +934,40 @@ Video360::~Video360() = default;
 bool Video360::Open(const std::string& path) {
     Impl& impl = *m_impl;
 
+    // Camera-feed v0 (docs/08-passthrough-limits.md): a ".pgm" path names a live tracking-
+    // camera dump (wmr_camera.c's wmr_camera_dump_snapshot_pgm(), ~/vr/cameraN.pgm), not a
+    // video file - skip ffmpeg entirely and let PollCameraLoop() (see Impl) poll it instead.
+    // The writer updates that path with a write-to-.tmp-then-rename(), which is atomic at the
+    // directory-entry level: any single open()+read() by PollCameraLoop either sees the
+    // complete old file or the complete new one, never a torn mix of both, so no locking is
+    // needed between the two processes.
+    if (path.size() >= 4 && path.compare(path.size() - 4, 4, ".pgm") == 0) {
+        int w = 0, h = 0;
+        std::vector<uint8_t> probe;
+        if (!ReadPgmFile(path, w, h, probe)) {
+            Log::Write(Log::Level::Error, Fmt("video360: cannot read PGM header from '%s'", path.c_str()));
+            return false;
+        }
+        if ((w % 2) != 0 || (h % 2) != 0) {
+            Log::Write(Log::Level::Error,
+                       Fmt("video360: camera feed %dx%d is not even-sized (needed for NV12 half-res chroma)", w, h));
+            return false;
+        }
+        impl.cameraMode = true;
+        impl.cameraPath = path;
+        impl.width = w;
+        impl.height = h;
+        impl.durationSeconds = 0.0;  // live, no length
+        impl.frameDuration = 1.0;    // nominal only; FrameRate() reports the measured rate instead
+        impl.codecName = "camera-pgm (live, v0 flat, no reprojection)";
+        impl.fullRange = true;  // sensor bytes map straight to 0-255, no studio-range rescale
+        impl.bt709 = true;      // irrelevant: neutral (0x80) chroma makes R=G=B=Y either way
+        impl.opened = true;
+        Log::Write(Log::Level::Info,
+                   Fmt("video360: '%s' %dx%d live camera feed (docs/08 v0 - flat, unreprojected)", path.c_str(), w, h));
+        return true;
+    }
+
     int ret = avformat_open_input(&impl.fmt, path.c_str(), nullptr, nullptr);
     if (ret < 0) {
         Log::Write(Log::Level::Error, Fmt("video360: cannot open '%s': %s", path.c_str(), AvErr(ret).c_str()));
@@ -1000,10 +1143,14 @@ bool Video360::Start() {
     }
     impl.statWindow = std::chrono::steady_clock::now();
     impl.started = true;
-    impl.thread = std::thread([&impl] { impl.DecodeLoop(); });
+    if (impl.cameraMode) {
+        impl.thread = std::thread([&impl] { impl.PollCameraLoop(); });
+    } else {
+        impl.thread = std::thread([&impl] { impl.DecodeLoop(); });
 #if defined(HAVE_PULSE_SIMPLE)
-    if (impl.audioActive) impl.audioThread = std::thread([&impl] { impl.AudioThread(); });
+        if (impl.audioActive) impl.audioThread = std::thread([&impl] { impl.AudioThread(); });
 #endif
+    }
     return true;
 }
 
@@ -1019,6 +1166,7 @@ void Video360::SetRate(double rate) {
 
 bool Video360::Finished() const {
     Impl& impl = *m_impl;
+    if (impl.cameraMode) return false;  // a live feed never "finishes"
     if (impl.loop || !impl.started) return false;
     if (!impl.decodeDone) return false;
 
@@ -1035,7 +1183,14 @@ int Video360::Width() const { return m_impl->width; }
 int Video360::Height() const { return m_impl->height; }
 size_t Video360::YBytes() const { return m_impl->YBytes(); }
 size_t Video360::UVBytes() const { return m_impl->UVBytes(); }
-double Video360::FrameRate() const { return m_impl->frameDuration > 0.0 ? 1.0 / m_impl->frameDuration : 0.0; }
+double Video360::FrameRate() const {
+    Impl& impl = *m_impl;
+    // Camera mode: report what PollCameraLoop() actually measured, not the nominal
+    // frameDuration placeholder - this is the number docs/08's live test cares about (poll
+    // cadence vs. the dump's own ~1fps throttle vs. the 90Hz panel).
+    if (impl.cameraMode) return impl.measuredFps.load(std::memory_order_relaxed);
+    return impl.frameDuration > 0.0 ? 1.0 / impl.frameDuration : 0.0;
+}
 double Video360::Duration() const { return m_impl->durationSeconds; }
 double Video360::PlaybackPosition() const {
     Impl& impl = *m_impl;
@@ -1044,6 +1199,7 @@ double Video360::PlaybackPosition() const {
 }
 void Video360::Seek(double deltaSeconds) {
     Impl& impl = *m_impl;
+    if (impl.cameraMode) return;  // no seeking a live feed - impl.timeBase is 0.0 in this mode
     if (!impl.started || impl.decodeDone) return;
     std::lock_guard<std::mutex> lock(impl.mutex);
     double target = impl.playbackTime + deltaSeconds;
