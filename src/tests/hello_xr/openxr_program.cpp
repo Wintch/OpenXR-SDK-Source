@@ -643,7 +643,6 @@ struct OpenXrProgram : IOpenXrProgram {
                                                             {m_input.seekAction, thumbstickXPath[Side::RIGHT]},
                                                             {m_input.zoomAction, thumbstickYPath[Side::LEFT]},
                                                             {m_input.zoomAction, thumbstickYPath[Side::RIGHT]},
-                                                            {m_input.pauseAction, triggerValuePath[Side::LEFT]},
                                                             {m_input.pauseAction, triggerValuePath[Side::RIGHT]},
                                                             {m_input.recenterAction, squeezeValuePath[Side::LEFT]},
                                                             {m_input.recenterAction, squeezeValuePath[Side::RIGHT]},
@@ -806,6 +805,46 @@ struct OpenXrProgram : IOpenXrProgram {
         }
     }
 
+    // Synthetic floor reference (reverb-g2, 2026-09-05, docs/08 v0 passthrough): raw camera
+    // passthrough has no stable visual anchor the way a rendered game does (a floor/horizon the
+    // wearer can use to judge distance and orientation while walking) -- a live wearer confirmed
+    // this exact gap: "anda bien [el video]. Pero sin piso como geometria." Draws a plain line
+    // grid at the Stage origin (floor level by OpenXR convention), reusing the existing cube
+    // pipeline as thin boxes rather than a new shader/pipeline. Half-extent matches this
+    // project's SLAM_SESSION_ANCHOR_RADIUS_CM convention (3m) purely for a familiar scale, not
+    // because the two are otherwise related.
+    static void PushFloorGrid(std::vector<Cube>& cubes, const XrPosef& stagePose) {
+        constexpr float kHalfExtent = 3.0f;
+        constexpr float kSpacing = 1.0f;
+        constexpr float kLineWidth = 0.015f;
+        constexpr float kLineHeight = 0.005f;
+        const int lines = (int)(kHalfExtent / kSpacing);
+
+        for (int i = -lines; i <= lines; i++) {
+            const float offset = i * kSpacing;
+
+            // Line running along local X, at local Z = offset.
+            XrVector3f zLineOffsetLocal{0.f, 0.f, offset};
+            XrVector3f zLineOffsetWorld;
+            XrQuaternionf_RotateVector3f(&zLineOffsetWorld, &stagePose.orientation, &zLineOffsetLocal);
+            XrPosef zLinePose = stagePose;
+            zLinePose.position.x += zLineOffsetWorld.x;
+            zLinePose.position.y += zLineOffsetWorld.y;
+            zLinePose.position.z += zLineOffsetWorld.z;
+            cubes.push_back(Cube{zLinePose, {kHalfExtent * 2.f, kLineHeight, kLineWidth}});
+
+            // Line running along local Z, at local X = offset.
+            XrVector3f xLineOffsetLocal{offset, 0.f, 0.f};
+            XrVector3f xLineOffsetWorld;
+            XrQuaternionf_RotateVector3f(&xLineOffsetWorld, &stagePose.orientation, &xLineOffsetLocal);
+            XrPosef xLinePose = stagePose;
+            xLinePose.position.x += xLineOffsetWorld.x;
+            xLinePose.position.y += xLineOffsetWorld.y;
+            xLinePose.position.z += xLineOffsetWorld.z;
+            cubes.push_back(Cube{xLinePose, {kLineWidth, kLineHeight, kHalfExtent * 2.f}});
+        }
+    }
+
     void CreateVisualizedSpaces() {
         CHECK(m_session != XR_NULL_HANDLE);
 
@@ -818,6 +857,9 @@ struct OpenXrProgram : IOpenXrProgram {
             XrResult res = xrCreateReferenceSpace(m_session, &referenceSpaceCreateInfo, &space);
             if (XR_SUCCEEDED(res)) {
                 m_visualizedSpaces.push_back(space);
+                if (visualizedSpace == "Stage") {
+                    m_stageSpaceForFloorGrid = space;
+                }
             } else {
                 Log::Write(Log::Level::Warning,
                            Fmt("Failed to create reference space %s with error %d", visualizedSpace.c_str(), res));
@@ -1173,6 +1215,9 @@ struct OpenXrProgram : IOpenXrProgram {
 
             XrActionStateFloat grabValue{XR_TYPE_ACTION_STATE_FLOAT};
             CHECK_XRCMD(xrGetActionStateFloat(m_session, &getInfo, &grabValue));
+            Log::Write(Log::Level::Info, Fmt("DEBUGGRAB hand=%d isActive=%d currentState=%f changedSinceLastSync=%d",
+                                             (int)hand, (int)grabValue.isActive, grabValue.currentState,
+                                             (int)grabValue.changedSinceLastSync));
             if (grabValue.isActive == XR_TRUE) {
                 // Scale the rendered hand by 1.0f (open) to 0.5f (fully squeezed).
                 m_input.handScale[hand] = 1.0f - 0.5f * grabValue.currentState;
@@ -1241,6 +1286,19 @@ struct OpenXrProgram : IOpenXrProgram {
             getInfo.action = m_input.pauseAction;
             XrActionStateFloat pauseValue{XR_TYPE_ACTION_STATE_FLOAT};
             CHECK_XRCMD(xrGetActionStateFloat(m_session, &getInfo, &pauseValue));
+            Log::Write(Log::Level::Info, Fmt("DEBUGTRIGGER hand=%d isActive=%d currentState=%f",
+                                             (int)hand, (int)pauseValue.isActive, pauseValue.currentState));
+
+            if (hand == Side::LEFT) {
+                XrActionStateGetInfo anyInfo{XR_TYPE_ACTION_STATE_GET_INFO};
+                anyInfo.action = m_input.pauseAction;
+                anyInfo.subactionPath = XR_NULL_PATH;
+                XrActionStateFloat anyPauseValue{XR_TYPE_ACTION_STATE_FLOAT};
+                CHECK_XRCMD(xrGetActionStateFloat(m_session, &anyInfo, &anyPauseValue));
+                Log::Write(Log::Level::Info, Fmt("DEBUGANY isActive=%d currentState=%f",
+                                                 (int)anyPauseValue.isActive, anyPauseValue.currentState));
+            }
+
             if (pauseValue.isActive == XR_TRUE) {
                 if (!pauseLatched[hand] && pauseValue.currentState > 0.7f) {
                     PlayerControl::TogglePause();
@@ -1404,6 +1462,14 @@ struct OpenXrProgram : IOpenXrProgram {
         // For each locatable space that we want to visualize, render a 25cm cube.
         std::vector<Cube> cubes;
 
+        // HELLO_XR_FIXED_POSE (reverb-g2, 2026-09-05, docs/08 passthrough v0): a live camera-
+        // passthrough view, not ordinary rendered content -- the controller/reference-space
+        // gizmo cubes below z-fight against the passthrough image (both opaque geometry at
+        // similar apparent depth) and are meaningless for a raw passthrough demo anyway, so both
+        // are skipped in this mode; a floor grid is pushed instead, further down, as the visual
+        // anchor a passthrough view otherwise lacks entirely.
+        const bool passthroughMode = getenv("HELLO_XR_FIXED_POSE") != nullptr;
+
         // Reference-space cubes (ViewFront, Local, Stage, ...) are OFF by default; set
         // HELLO_XR_SPACE_CUBES=1 to get the original sample's behaviour back.
         //
@@ -1412,7 +1478,8 @@ struct OpenXrProgram : IOpenXrProgram {
         // inner faces render too and the viewer ends up sealed inside an opaque box that hides
         // everything else, controller cubes included. Found the hard way: "estoy dentro de un
         // cubo de colores, no veo los controles".
-        for (XrSpace visualizedSpace : (m_spaceCubesEnabled ? m_visualizedSpaces : std::vector<XrSpace>{})) {
+        for (XrSpace visualizedSpace :
+             ((m_spaceCubesEnabled && !passthroughMode) ? m_visualizedSpaces : std::vector<XrSpace>{})) {
             XrSpaceLocation spaceLocation{XR_TYPE_SPACE_LOCATION};
             res = xrLocateSpace(visualizedSpace, m_appSpace, predictedDisplayTime, &spaceLocation);
             CHECK_XRRESULT(res, "xrLocateSpace");
@@ -1439,7 +1506,8 @@ struct OpenXrProgram : IOpenXrProgram {
             CHECK_XRRESULT(res, "xrLocateSpace");
             handLocation[hand] = spaceLocation;
             if (XR_UNQUALIFIED_SUCCESS(res)) {
-                if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
+                if (!passthroughMode &&
+                    (spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
                     (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
                     PushPoseGizmo(cubes, spaceLocation.pose, m_input.handScale[hand]);
                 }
@@ -1451,6 +1519,25 @@ struct OpenXrProgram : IOpenXrProgram {
                     Log::Write(Log::Level::Verbose,
                                Fmt("Unable to locate %s hand action space in app space: %d", handName[hand], res));
                 }
+            }
+        }
+
+        // Synthetic floor reference for passthrough mode (see PushFloorGrid's comment).
+        //
+        // Height comes straight from Stage, not from any live recalibration: this project
+        // already has a proper per-wearer eye-height calibration (docs/58's T223 addendum +
+        // docs/59), tape-measured (standing 1.70 m, seated 1.35 m, see ~/vr/vr-profile.conf)
+        // and applied by jack-in-wayland.sh as XRT_TRACKING_ORIGIN_OFFSET_Y, which Monado's
+        // space overseer bakes into every tracking origin -- Stage's Y=0 IS the calibrated
+        // real floor already (see docs/08, 2026-09-05 entry, for the full mechanism and why
+        // an earlier live-recalibration attempt here was a regression, not a fix).
+        if (passthroughMode && m_stageSpaceForFloorGrid != XR_NULL_HANDLE) {
+            XrSpaceLocation stageLocation{XR_TYPE_SPACE_LOCATION};
+            res = xrLocateSpace(m_stageSpaceForFloorGrid, m_appSpace, predictedDisplayTime, &stageLocation);
+            if (XR_UNQUALIFIED_SUCCESS(res) &&
+                (stageLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
+                (stageLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
+                PushFloorGrid(cubes, stageLocation.pose);
             }
         }
 
@@ -1605,6 +1692,13 @@ struct OpenXrProgram : IOpenXrProgram {
     int64_t m_depthSwapchainFormat{-1};
 
     std::vector<XrSpace> m_visualizedSpaces;
+
+    //! Dedicated handle to the "Stage" space specifically (reverb-g2, 2026-09-05, docs/08
+    //! passthrough v0 floor grid) -- independent of m_visualizedSpaces/m_spaceCubesEnabled,
+    //! which are about the OPT-IN reference-space cube visualisation, off by default. The
+    //! floor grid always wants Stage specifically (it IS the floor, by OpenXR convention),
+    //! regardless of whether that debug toggle is on.
+    XrSpace m_stageSpaceForFloorGrid{XR_NULL_HANDLE};
 
     //! See the loop that reads this. Opt-in: HELLO_XR_SPACE_CUBES=1.
     const bool m_spaceCubesEnabled{[] {
