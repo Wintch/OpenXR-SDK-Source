@@ -1506,8 +1506,11 @@ struct OpenXrProgram : IOpenXrProgram {
             CHECK_XRRESULT(res, "xrLocateSpace");
             handLocation[hand] = spaceLocation;
             if (XR_UNQUALIFIED_SUCCESS(res)) {
-                if (!passthroughMode &&
-                    (spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
+                // 2026-09-05: controllers are drawn in passthrough mode too now that the
+                // cube pipeline's view matrix (graphicsplugin_vulkan.cpp) tracks real live head
+                // orientation + recenter, matching the video -- previously skipped here only to
+                // avoid the z-fight/desync the OLD frozen-vs-real mismatch caused.
+                if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
                     (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
                     PushPoseGizmo(cubes, spaceLocation.pose, m_input.handScale[hand]);
                 }
