@@ -805,44 +805,75 @@ struct OpenXrProgram : IOpenXrProgram {
         }
     }
 
-    // Synthetic floor reference (reverb-g2, 2026-09-05, docs/08 v0 passthrough): raw camera
-    // passthrough has no stable visual anchor the way a rendered game does (a floor/horizon the
-    // wearer can use to judge distance and orientation while walking) -- a live wearer confirmed
-    // this exact gap: "anda bien [el video]. Pero sin piso como geometria." Draws a plain line
-    // grid at the Stage origin (floor level by OpenXR convention), reusing the existing cube
-    // pipeline as thin boxes rather than a new shader/pipeline. Half-extent matches this
-    // project's SLAM_SESSION_ANCHOR_RADIUS_CM convention (3m) purely for a familiar scale, not
-    // because the two are otherwise related.
-    static void PushFloorGrid(std::vector<Cube>& cubes, const XrPosef& stagePose) {
-        constexpr float kHalfExtent = 3.0f;
-        constexpr float kSpacing = 1.0f;
-        constexpr float kLineWidth = 0.015f;
-        constexpr float kLineHeight = 0.005f;
-        const int lines = (int)(kHalfExtent / kSpacing);
+    // Room-box placeholder (reverb-g2, 2026-09-05, docs/08 v0 passthrough), replacing the
+    // earlier 7x7 line-grid this function used to draw. Raw camera passthrough has no stable
+    // visual anchor the way a rendered game does (a floor/horizon the wearer can use to judge
+    // distance and orientation while walking) -- a live wearer confirmed this exact gap: "anda
+    // bien [el video]. Pero sin piso como geometria." This v0 is a SIMPLE placeholder room
+    // boundary, per the wearer's own request today: "hacelo todo griz, piso blanco. Para
+    // arrancar con un algo" (make it all gray, floor white, to start with something) --
+    // explicitly NOT the more sophisticated walk-the-perimeter capture tool planned separately
+    // for OpenXRdesk (a future, project-level feature, out of scope here). Built from the same
+    // Cube / cube-pipeline mechanism as the old grid, just solid slabs instead of thin lines,
+    // using the new solid-color path (kGizmoAxisSolidGray/kGizmoAxisSolidWhite, see
+    // graphicsplugin.h) instead of the default per-face cube coloring.
+    //
+    // Room dimensions are the wearer's own tape measurement of today's test room (see
+    // project_g2_passthrough_feasibility): 2.30m x 2.81m footprint, 2.50m ceiling.
+    //
+    // Room-to-tracking-origin alignment is NOT calibrated today (no walk-the-perimeter has
+    // been done) -- this v0 makes the pragmatic, EXPLICITLY APPROXIMATE assumption that the
+    // Stage origin (stagePose's own X/Z = 0,0) sits at the room's geometric center, so the
+    // walls land at X = +-1.15m, Z = +-1.405m (half the footprint each way). A real
+    // calibration would fix this; until then, treat wall placement as "roughly right", not
+    // measured-in-place.
+    static void PushRoomBox(std::vector<Cube>& cubes, const XrPosef& stagePose) {
+        constexpr float kRoomWidthX = 2.30f;      // wearer-measured footprint, X axis (this
+                                                    // project's arbitrary axis assignment --
+                                                    // the two footprint dimensions aren't tied
+                                                    // to any real-world compass direction here)
+        constexpr float kRoomDepthZ = 2.81f;       // wearer-measured footprint, Z axis
+        constexpr float kCeilingHeight = 2.50f;    // wearer-measured ceiling height
+        constexpr float kFloorThickness = 0.02f;   // thin plate, just enough to read as a surface
+        constexpr float kWallThickness = 0.05f;    // ditto for walls
+        const float halfX = kRoomWidthX * 0.5f;    // 1.15m
+        const float halfZ = kRoomDepthZ * 0.5f;     // 1.405m
+        const float wallCenterY = kCeilingHeight * 0.5f;  // 1.25m: a floor-to-ceiling wall spans
+                                                            // local Y 0..2.50, so its own center
+                                                            // sits at local Y = +1.25
 
-        for (int i = -lines; i <= lines; i++) {
-            const float offset = i * kSpacing;
+        // Places one slab at localOffset (Stage-local: +X/+Z horizontal, +Y up), rotated into
+        // world space by stagePose.orientation and added to stagePose.position -- the exact
+        // per-cube positioning the old line-grid used (Y was always 0 there, but OpenXR
+        // guarantees both LOCAL and STAGE are gravity-aligned, i.e. any transform between them
+        // is a pure yaw + translation, so rotating a non-zero local Y by it still leaves Y
+        // untouched and only mixes X/Z -- safe to reuse unchanged). This is the SAME
+        // xrLocateSpace/stagePose Stage-space call the render loop already made before calling
+        // this function (unchanged below), so the already-fixed live-orientation view-matrix
+        // handling (graphicsplugin_vulkan.cpp's RenderView, commit f4cb82f) applies to every
+        // slab automatically: it only ever looks at each Cube's resulting world Pose.
+        auto pushSlab = [&](XrVector3f localOffset, XrVector3f scale, int32_t color) {
+            XrVector3f worldOffset;
+            XrQuaternionf_RotateVector3f(&worldOffset, &stagePose.orientation, &localOffset);
+            XrPosef slabPose = stagePose;
+            slabPose.position.x += worldOffset.x;
+            slabPose.position.y += worldOffset.y;
+            slabPose.position.z += worldOffset.z;
+            cubes.push_back(Cube{slabPose, scale, color});
+        };
 
-            // Line running along local X, at local Z = offset.
-            XrVector3f zLineOffsetLocal{0.f, 0.f, offset};
-            XrVector3f zLineOffsetWorld;
-            XrQuaternionf_RotateVector3f(&zLineOffsetWorld, &stagePose.orientation, &zLineOffsetLocal);
-            XrPosef zLinePose = stagePose;
-            zLinePose.position.x += zLineOffsetWorld.x;
-            zLinePose.position.y += zLineOffsetWorld.y;
-            zLinePose.position.z += zLineOffsetWorld.z;
-            cubes.push_back(Cube{zLinePose, {kHalfExtent * 2.f, kLineHeight, kLineWidth}});
+        // Floor: one solid white slab spanning the full footprint, centered at the origin, at
+        // stagePose's own height (Stage's Y=0 IS the calibrated real floor -- see the render
+        // loop's call site comment, unchanged).
+        pushSlab({0.f, 0.f, 0.f}, {kRoomWidthX, kFloorThickness, kRoomDepthZ}, kGizmoAxisSolidWhite);
 
-            // Line running along local Z, at local X = offset.
-            XrVector3f xLineOffsetLocal{offset, 0.f, 0.f};
-            XrVector3f xLineOffsetWorld;
-            XrQuaternionf_RotateVector3f(&xLineOffsetWorld, &stagePose.orientation, &xLineOffsetLocal);
-            XrPosef xLinePose = stagePose;
-            xLinePose.position.x += xLineOffsetWorld.x;
-            xLinePose.position.y += xLineOffsetWorld.y;
-            xLinePose.position.z += xLineOffsetWorld.z;
-            cubes.push_back(Cube{xLinePose, {kLineWidth, kLineHeight, kHalfExtent * 2.f}});
-        }
+        // Four walls, floor to ceiling, solid gray. X walls span the full Z depth and Z walls
+        // span the full X width, so each corner has a small (kWallThickness-sized) gap rather
+        // than a mitred join -- fine for a placeholder, not a real calibrated boundary.
+        pushSlab({+halfX, wallCenterY, 0.f}, {kWallThickness, kCeilingHeight, kRoomDepthZ}, kGizmoAxisSolidGray);
+        pushSlab({-halfX, wallCenterY, 0.f}, {kWallThickness, kCeilingHeight, kRoomDepthZ}, kGizmoAxisSolidGray);
+        pushSlab({0.f, wallCenterY, +halfZ}, {kRoomWidthX, kCeilingHeight, kWallThickness}, kGizmoAxisSolidGray);
+        pushSlab({0.f, wallCenterY, -halfZ}, {kRoomWidthX, kCeilingHeight, kWallThickness}, kGizmoAxisSolidGray);
     }
 
     void CreateVisualizedSpaces() {
@@ -1525,7 +1556,7 @@ struct OpenXrProgram : IOpenXrProgram {
             }
         }
 
-        // Synthetic floor reference for passthrough mode (see PushFloorGrid's comment).
+        // Synthetic room-box reference for passthrough mode (see PushRoomBox's comment).
         //
         // Height comes straight from Stage, not from any live recalibration: this project
         // already has a proper per-wearer eye-height calibration (docs/58's T223 addendum +
@@ -1538,7 +1569,7 @@ struct OpenXrProgram : IOpenXrProgram {
         // floorYForLog: same m_appSpace-relative Y as the head/controller HELLO_XR_POSE_LOG
         // line just below -- both come from xrLocateSpace/xrLocateViews against the SAME
         // m_appSpace, so (head.y - floorYForLog) is directly the wearer's real measured eye
-        // height above wherever this grid actually renders. 2026-09-05: added to settle a
+        // height above wherever this floor actually renders. 2026-09-05: added to settle a
         // live "feels too high" report with a number instead of another guess.
         float floorYForLog = std::numeric_limits<float>::quiet_NaN();
         if (passthroughMode && m_stageSpaceForFloorGrid != XR_NULL_HANDLE) {
@@ -1548,7 +1579,7 @@ struct OpenXrProgram : IOpenXrProgram {
                 (stageLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
                 (stageLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
                 floorYForLog = stageLocation.pose.position.y;
-                PushFloorGrid(cubes, stageLocation.pose);
+                PushRoomBox(cubes, stageLocation.pose);
             }
         }
 

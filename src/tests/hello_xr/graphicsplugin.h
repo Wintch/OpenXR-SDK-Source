@@ -8,6 +8,14 @@
 #include <nonstd/span.hpp>
 using nonstd::span;
 
+// Sentinel values for Cube::GizmoAxis below -1 select a plain solid color, independent of
+// the axis-gizmo mechanism (0-5). Added 2026-09-05 for the reverb-g2 room-box v0 (see
+// PushRoomBox in openxr_program.cpp): the room's floor/walls need a flat, uncalibrated color
+// rather than the default per-face cube coloring or an axis color. Purely additive - see
+// cube_vert.glsl for where these are interpreted.
+constexpr int32_t kGizmoAxisSolidGray = -2;
+constexpr int32_t kGizmoAxisSolidWhite = -3;
+
 struct Cube {
     XrPosef Pose;
     XrVector3f Scale;
@@ -17,8 +25,10 @@ struct Cube {
     // PushPoseGizmo in openxr_program.cpp - rendered as a single solid axis color instead,
     // bright on its own positive half and dim on its negative half (see cube_vert.glsl).
     // 3/4/5 (axis + 3): that same axis's positive-tip marker cube, always full brightness,
-    // no light/dark split. Reference-space cubes and everything else built with the
-    // 2-argument Cube{Pose, Scale} form are unaffected: this just defaults to "off".
+    // no light/dark split. kGizmoAxisSolidGray/kGizmoAxisSolidWhite (-2/-3): a flat solid
+    // color, no per-face or per-axis variation - see the constants above and cube_vert.glsl.
+    // Reference-space cubes and everything else built with the 2-argument Cube{Pose, Scale}
+    // form are unaffected: this just defaults to "off".
     int32_t GizmoAxis{-1};
 };
 

@@ -19,7 +19,9 @@ layout (std140, push_constant) uniform buf
     int gizmoAxis;  // -1 = off (ordinary per-face Color below). 0/1/2 = controller-gizmo
                      // axis bar (X/Y/Z), dimmed on its own negative half. 3/4/5 = that axis's
                      // POSITIVE-tip marker cube, always fully bright (see below) - see
-                     // PushPoseGizmo in openxr_program.cpp.
+                     // PushPoseGizmo in openxr_program.cpp. -2/-3 = flat solid gray/white (see
+                     // below) - matches graphicsplugin.h's kGizmoAxisSolidGray/
+                     // kGizmoAxisSolidWhite, used by PushRoomBox in openxr_program.cpp.
 } ubuf;
 
 layout (location = 0) in vec3 Position;
@@ -55,6 +57,12 @@ void main()
         float t = (axis == 0) ? Position.x : (axis == 1) ? Position.y : Position.z;
         float bright = isTip ? 1.0 : ((t >= 0.0) ? 1.0 : 0.25);
         oColor.rgb = axisColor * bright;
+    } else if (ubuf.gizmoAxis == -2) {
+        // Room-box wall (reverb-g2 v0, PushRoomBox) - flat solid gray, same on every face.
+        oColor.rgb = vec3(0.5);
+    } else if (ubuf.gizmoAxis == -3) {
+        // Room-box floor (reverb-g2 v0, PushRoomBox) - flat solid white, same on every face.
+        oColor.rgb = vec3(1.0);
     } else {
         oColor.rgb = Color.rgb;
     }
