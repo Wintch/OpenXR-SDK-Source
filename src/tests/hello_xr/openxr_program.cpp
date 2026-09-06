@@ -1541,7 +1541,17 @@ struct OpenXrProgram : IOpenXrProgram {
                 // cube pipeline's view matrix (graphicsplugin_vulkan.cpp) tracks real live head
                 // orientation + recenter, matching the video -- previously skipped here only to
                 // avoid the z-fight/desync the OLD frozen-vs-real mismatch caused.
+                //
+                // Also require POSITION_TRACKED, not just POSITION_VALID: an untracked
+                // controller is still "valid" (Monado pins it at a fixed placeholder offset
+                // from the tracking origin -- see the POSE_LOG comment above), and in ctrl mode
+                // that offset is the tracking origin itself, i.e. right where the wearer's own
+                // head is pinned too. Without this check, a merely-valid-but-untracked
+                // controller renders its gizmo cube essentially glued to the camera -- reported
+                // live as "cubos de colores enormes" (the cube filling the view from point-
+                // blank range) with z-fighting from sitting right at the near clip plane.
                 if ((spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0 &&
+                    (spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) != 0 &&
                     (spaceLocation.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0) {
                     PushPoseGizmo(cubes, spaceLocation.pose, m_input.handScale[hand]);
                 }
