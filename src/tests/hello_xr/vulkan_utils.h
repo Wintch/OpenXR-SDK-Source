@@ -1058,7 +1058,8 @@ struct Pipeline {
 
     void CreateGraphics(VkDevice device, VkExtent2D /*size*/, const PipelineLayout& layout, const RenderPass& rp,
                         const ShaderProgram& sp, const VkVertexInputBindingDescription& bindDesc,
-                        span<const VkVertexInputAttributeDescription> attrDesc, span<VkDynamicState> dynamicStates) {
+                        span<const VkVertexInputAttributeDescription> attrDesc, span<VkDynamicState> dynamicStates,
+                        bool depthWriteEnable = true) {
         m_vkDevice = device;
 
         VkPipelineDynamicStateCreateInfo dynamicState{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
@@ -1117,7 +1118,17 @@ struct Pipeline {
 
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         ds.depthTestEnable = VK_TRUE;
-        ds.depthWriteEnable = VK_TRUE;
+        // The fullscreen pano/video pass (hello_xr's photo pipeline, see the comment on its
+        // Create() call in graphicsplugin_vulkan.cpp) passes depthWriteEnable=false here: its
+        // vertex shader emits a hardcoded clip-space z of 0.0 (nearest possible depth --
+        // VertexShaderGlsl's `gl_Position = vec4(oNdc, 0.0, 1.0)`) that has no relation to real
+        // scene depth. Left writable, that constant used to land in the depth buffer covering
+        // the whole screen and then unconditionally beat every real cube's own depth under the
+        // LESS compare below -- that was the z-fighting/occlusion bug (docs/08). Depth TEST
+        // stays on for every caller (including the pano pass, which harmlessly always passes it
+        // since it draws first against a freshly-cleared far value) so this one struct can serve
+        // every pipeline without diverging further than the one bit that actually differs.
+        ds.depthWriteEnable = depthWriteEnable ? VK_TRUE : VK_FALSE;
         ds.depthCompareOp = VK_COMPARE_OP_LESS;
         ds.depthBoundsTestEnable = VK_FALSE;
         ds.stencilTestEnable = VK_FALSE;
@@ -1165,10 +1176,10 @@ struct Pipeline {
 
     void Create(VkDevice device, VkExtent2D size, const PipelineLayout& layout, const RenderPass& rp, const ShaderProgram& sp,
                 const VkVertexInputBindingDescription& bindDesc, span<const VkVertexInputAttributeDescription> attrDesc,
-                span<VkDynamicState> dynamicStates) {
+                span<VkDynamicState> dynamicStates, bool depthWriteEnable = true) {
         switch (sp.m_programType) {
             case SHADER_PROGRAM_TYPE_GRAPHICS:
-                CreateGraphics(device, size, layout, rp, sp, bindDesc, attrDesc, dynamicStates);
+                CreateGraphics(device, size, layout, rp, sp, bindDesc, attrDesc, dynamicStates, depthWriteEnable);
                 break;
             case SHADER_PROGRAM_TYPE_COMPUTE:
                 CreateCompute(device, size, layout, rp, sp, bindDesc, attrDesc, dynamicStates);

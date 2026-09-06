@@ -360,7 +360,16 @@ struct VulkanArraySliceState {
         m_renderTarget.resize(capacity);
         m_rp.Create(namer, device, colorFormat, depthFormat, sampleCount);
         VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_VIEWPORT};
-        m_pipe.Create(device, size, layout, m_rp, sp, bindDesc, attrDesc, dynamicStates);
+        // depthWriteEnable=false: this pipeline draws the 360-photo/live-camera fullscreen
+        // triangle, whose vertex shader (VertexShaderGlsl above) outputs a hardcoded near-plane
+        // clip-space z of 0.0 that has no relation to real scene depth. Writing that into the
+        // depth buffer used to let this background unconditionally defeat every cube's own
+        // depth test below (the z-fighting/occlusion bug reintroduced 2026-09-05 when passthrough
+        // controller cubes were re-enabled, docs/08) -- it must never compete for depth, only
+        // ever lose to real geometry, which a depth WRITE of false guarantees no matter what
+        // value the shader happens to emit. Depth TEST stays on (see vulkan_utils.h) and is a
+        // no-op here since this always draws first against a freshly-cleared far value.
+        m_pipe.Create(device, size, layout, m_rp, sp, bindDesc, attrDesc, dynamicStates, /*depthWriteEnable=*/false);
         // Same layout and render pass, different shaders: this one consumes the cube vertex
         // buffer's attributes, which the 360 pipeline's fullscreen-triangle shader ignores.
         m_pipeCube.Create(device, size, layout, m_rp, spCube, bindDesc, attrDesc, dynamicStates);
@@ -2108,11 +2117,17 @@ struct VulkanGraphicsPlugin : public IGraphicsPlugin {
         // whole screen and a stray controller/reference-space cube drawn on top would be
         // exactly the kind of world geometry those modes exist to rule out. Counter mode is
         // left alone - it's a small additive overlay on otherwise-normal content, cubes and all.
-        // HELLO_XR_FIXED_POSE (reverb-g2, 2026-09-05, docs/08 passthrough v0): controller/
-        // reference-space cubes used to z-fight against the live camera image here too, but
-        // that is now handled at the SOURCE (openxr_program.cpp no longer pushes those cubes in
-        // passthrough mode at all, and pushes a floor grid instead) -- nothing passthrough-
-        // specific belongs in this renderer, it just draws whatever is in the cubes vector.
+        // HELLO_XR_FIXED_POSE (reverb-g2, 2026-09-05, docs/08 passthrough v0): reference-space
+        // cubes are suppressed at the SOURCE in passthrough mode (openxr_program.cpp no longer
+        // pushes them at all, pushing a floor grid instead) -- nothing passthrough-specific
+        // belongs in THIS function, it just draws whatever is in the cubes vector. Controller
+        // cubes, by contrast, ARE pushed and drawn here in passthrough mode (re-enabled the same
+        // day, "dibujar los joy en su lugar"). They used to z-fight against the live camera image
+        // once drawn: not a draw-order problem in this function, but the photo/video pipeline
+        // (m_pipe, created in VulkanArraySliceState::init above) writing a hardcoded near-plane
+        // depth for every pixel it covers and unconditionally beating the cubes' own depth below.
+        // Fixed at that pipeline's creation (depthWriteEnable=false there) rather than here, so
+        // this draw call needs no passthrough-specific logic of its own.
         const bool suppressCubesForTestPattern = (testPattern == TestPattern::Toggle || testPattern == TestPattern::Card);
         if (!cubes.empty() && !suppressCubesForTestPattern) {
             swapchainData->BindCubePipeline(m_cmdBuffer.buf, imageArrayIndex);
